@@ -1,9 +1,16 @@
-import { DEFAULT_SETTINGS, type ExamCheckpoint, type HistoryRecord, type UserSettings } from "./types";
+import {
+  DEFAULT_SETTINGS,
+  type Accent,
+  type ExamCheckpoint,
+  type HistoryRecord,
+  type UserSettings,
+} from "./types";
 
 const SETTINGS_KEY = "vocalis.settings.v1";
 const HISTORY_KEY = "vocalis.history.v1";
 const CHECKPOINT_KEY = "vocalis.checkpoint.v1";
 const RECENT_TOPICS_KEY = "vocalis.recent-topics.v1";
+const RECENT_EXAMINERS_KEY = "vocalis.recent-examiners.v1";
 const DB_NAME = "vocalis-audio-v1";
 const STORE_NAME = "recordings";
 
@@ -23,7 +30,26 @@ function writeJson(key: string, value: unknown) {
 }
 
 export function loadSettings(): UserSettings {
-  return { ...DEFAULT_SETTINGS, ...readJson<Partial<UserSettings>>(SETTINGS_KEY, {}) };
+  const stored = readJson<Partial<UserSettings>>(SETTINGS_KEY, {});
+  const legacyVoiceByAccent = {
+    "en-GB": "gb-female",
+    "en-US": "us-female",
+    "en-AU": "au-female",
+    "en-IN": "in-female",
+  } as const;
+  const accent =
+    stored.accent && Object.hasOwn(legacyVoiceByAccent, stored.accent)
+      ? stored.accent
+      : DEFAULT_SETTINGS.accent;
+  return {
+    ...DEFAULT_SETTINGS,
+    ...stored,
+    accent,
+    practiceVoiceId: stored.practiceVoiceId ?? legacyVoiceByAccent[accent],
+    excludedAccents: Array.isArray(stored.excludedAccents)
+      ? stored.excludedAccents
+      : [],
+  };
 }
 
 export function saveSettings(settings: UserSettings) {
@@ -47,7 +73,8 @@ export function saveCheckpoint(checkpoint: ExamCheckpoint) {
 }
 
 export function clearCheckpoint() {
-  if (typeof window !== "undefined") window.localStorage.removeItem(CHECKPOINT_KEY);
+  if (typeof window !== "undefined")
+    window.localStorage.removeItem(CHECKPOINT_KEY);
 }
 
 export function loadRecentTopicIds(): string[] {
@@ -58,6 +85,33 @@ export function saveRecentTopicIds(ids: string[]) {
   writeJson(RECENT_TOPICS_KEY, [...new Set(ids)].slice(0, 12));
 }
 
+export interface RecentExaminerUsage {
+  profileId: string;
+  accent: Accent;
+}
+
+export function loadRecentExaminerUsage(): RecentExaminerUsage[] {
+  return readJson<RecentExaminerUsage[]>(RECENT_EXAMINERS_KEY, [])
+    .filter(
+      (item) =>
+        item &&
+        typeof item.profileId === "string" &&
+        typeof item.accent === "string",
+    )
+    .slice(0, 6);
+}
+
+export function saveRecentExaminerUsage(items: RecentExaminerUsage[]) {
+  const seen = new Set<string>();
+  const unique = items.filter((item) => {
+    const key = `${item.profileId}:${item.accent}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  writeJson(RECENT_EXAMINERS_KEY, unique.slice(0, 6));
+}
+
 function openAudioDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === "undefined") {
@@ -66,10 +120,12 @@ function openAudioDb(): Promise<IDBDatabase> {
     }
     const request = indexedDB.open(DB_NAME, 1);
     request.onupgradeneeded = () => {
-      if (!request.result.objectStoreNames.contains(STORE_NAME)) request.result.createObjectStore(STORE_NAME);
+      if (!request.result.objectStoreNames.contains(STORE_NAME))
+        request.result.createObjectStore(STORE_NAME);
     };
     request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("Unable to open audio database"));
+    request.onerror = () =>
+      reject(request.error ?? new Error("Unable to open audio database"));
   });
 }
 
@@ -79,7 +135,8 @@ export async function saveAudioBlob(id: string, blob: Blob): Promise<void> {
     const transaction = db.transaction(STORE_NAME, "readwrite");
     transaction.objectStore(STORE_NAME).put(blob, id);
     transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error ?? new Error("Unable to save recording"));
+    transaction.onerror = () =>
+      reject(transaction.error ?? new Error("Unable to save recording"));
   });
   db.close();
 }
@@ -87,9 +144,14 @@ export async function saveAudioBlob(id: string, blob: Blob): Promise<void> {
 export async function loadAudioBlob(id: string): Promise<Blob | null> {
   const db = await openAudioDb();
   const result = await new Promise<Blob | null>((resolve, reject) => {
-    const request = db.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).get(id);
-    request.onsuccess = () => resolve((request.result as Blob | undefined) ?? null);
-    request.onerror = () => reject(request.error ?? new Error("Unable to load recording"));
+    const request = db
+      .transaction(STORE_NAME, "readonly")
+      .objectStore(STORE_NAME)
+      .get(id);
+    request.onsuccess = () =>
+      resolve((request.result as Blob | undefined) ?? null);
+    request.onerror = () =>
+      reject(request.error ?? new Error("Unable to load recording"));
   });
   db.close();
   return result;
@@ -101,11 +163,16 @@ export async function deleteAudioBlob(id: string): Promise<void> {
     const transaction = db.transaction(STORE_NAME, "readwrite");
     transaction.objectStore(STORE_NAME).delete(id);
     transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error ?? new Error("Unable to delete recording"));
+    transaction.onerror = () =>
+      reject(transaction.error ?? new Error("Unable to delete recording"));
   });
   db.close();
 }
 
 export async function deleteRecordAudio(record: HistoryRecord): Promise<void> {
-  await Promise.all(record.segments.map((segment) => deleteAudioBlob(segment.id).catch(() => undefined)));
+  await Promise.all(
+    record.segments.map((segment) =>
+      deleteAudioBlob(segment.id).catch(() => undefined),
+    ),
+  );
 }
