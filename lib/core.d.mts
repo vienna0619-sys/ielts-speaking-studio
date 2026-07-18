@@ -60,6 +60,65 @@ export interface ExamPlan {
   part3: Question[];
 }
 
+export type ExaminerAccent = "en-GB" | "en-US" | "en-AU" | "en-IN";
+export type ExaminerVoiceId =
+  | "gb-female"
+  | "gb-male"
+  | "us-female"
+  | "us-male"
+  | "au-female"
+  | "au-male"
+  | "in-female"
+  | "in-male";
+export type ExaminerGenderPresentation = "female" | "male";
+
+export interface ExaminerVoicePreset {
+  id: ExaminerVoiceId;
+  label: string;
+  accent: ExaminerAccent;
+  locale: ExaminerAccent;
+  genderPresentation: ExaminerGenderPresentation;
+  speakingRate: number;
+  pitch: number;
+  volume: number;
+  qualityLevel: "high";
+  enabled: boolean;
+  supportedModes: ("mock-exam" | "practice")[];
+  fallbackVoiceId: ExaminerVoiceId;
+  baseWeight: number;
+}
+
+export interface ExaminerAvatarDefinition {
+  id: string;
+  displayName: string;
+  appearanceProfile: string;
+  genderPresentation: ExaminerGenderPresentation;
+  estimatedAgeRange: string;
+  enabled: boolean;
+}
+
+export interface ExaminerProfile {
+  id: string;
+  sessionId: string;
+  displayName: string;
+  avatarId: string;
+  appearanceProfile: string;
+  voiceProvider: "adaptive";
+  voiceId: ExaminerVoiceId;
+  accent: ExaminerAccent;
+  locale: ExaminerAccent;
+  genderPresentation: ExaminerGenderPresentation;
+  estimatedAgeRange: string;
+  speakingRate: number;
+  pitch: number;
+  volume: number;
+  qualityLevel: "high";
+  enabled: boolean;
+  supportedModes: ("mock-exam" | "practice")[];
+  fallbackVoiceId: ExaminerVoiceId;
+  createdAt: string;
+}
+
 export interface SpeechSegmentInput {
   text?: string;
   durationSec?: number;
@@ -104,14 +163,40 @@ export const EXAM_STATES: ExamState[];
 export const INTRODUCTION_QUESTIONS: string[];
 export const PART1_TOPICS: Part1Topic[];
 export const PART2_SETS: Part2Set[];
+export const EXAMINER_VOICE_PRESETS: ExaminerVoicePreset[];
+export const EXAMINER_AVATARS: ExaminerAvatarDefinition[];
 export function transitionExam(state: ExamState, event: string): ExamState;
-export function createExamPlan(options?: { seed?: string | number; recentTopicIds?: string[] }): ExamPlan;
+export function createExamPlan(options?: {
+  seed?: string | number;
+  recentTopicIds?: string[];
+}): ExamPlan;
+export function createExaminerProfile(options?: {
+  seed?: string | number;
+  availableVoiceIds?: ExaminerVoiceId[];
+  recentProfileIds?: string[];
+  recentAccents?: ExaminerAccent[];
+  randomEnabled?: boolean;
+  accentMode?: "all" | "familiar" | "british";
+  fixedVoiceId?: ExaminerVoiceId;
+  excludedAccents?: ExaminerAccent[];
+  forcedAccent?: ExaminerAccent | null;
+  avoidAccent?: ExaminerAccent | null;
+}): ExaminerProfile;
 export function formatTime(totalSeconds: number): string;
 export function nextCountdown(seconds: number): number;
-export function timerReachedLimit(elapsedSeconds: number, limitSeconds: number): boolean;
-export function calculateSpeechMetrics(segments?: SpeechSegmentInput[]): SpeechMetrics;
+export function timerReachedLimit(
+  elapsedSeconds: number,
+  limitSeconds: number,
+): boolean;
+export function calculateSpeechMetrics(
+  segments?: SpeechSegmentInput[],
+): SpeechMetrics;
 export function estimateMockScores(metrics: SpeechMetrics): ScoreReport;
-export function buildPracticeFeedback(text?: string, durationSec?: number, part?: 1 | 2 | 3): {
+export function buildPracticeFeedback(
+  text?: string,
+  durationSec?: number,
+  part?: 1 | 2 | 3,
+): {
   band: number;
   tooShort: boolean;
   wordCount: number;
@@ -122,6 +207,10 @@ export function buildPracticeFeedback(text?: string, durationSec?: number, part?
   improvedAnswer: string;
 };
 export function movingAverage(values: number[], windowSize?: number): number[];
-export function prependHistoryRecord<T extends { id: string }>(records: T[], record: T, limit?: number): T[];
+export function prependHistoryRecord<T extends { id: string }>(
+  records: T[],
+  record: T,
+  limit?: number,
+): T[];
 export function providerErrorStatus(status: number): string;
 export function microphoneErrorMessage(name: string): string;

@@ -2,10 +2,12 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   EXAM_STATES,
+  EXAMINER_VOICE_PRESETS,
   PART2_SETS,
   buildPracticeFeedback,
   calculateSpeechMetrics,
   createExamPlan,
+  createExaminerProfile,
   estimateMockScores,
   formatTime,
   microphoneErrorMessage,
@@ -99,4 +101,72 @@ test("provider and microphone failures map to explicit user-facing errors", () =
   assert.match(providerErrorStatus(503), /暂时不可用/);
   assert.match(microphoneErrorMessage("NotAllowedError"), /权限/);
   assert.match(microphoneErrorMessage("NotFoundError"), /没有找到/);
+});
+
+test("examiner assignment is deterministic for a session seed", () => {
+  const options = {
+    seed: "session-42",
+    availableVoiceIds: EXAMINER_VOICE_PRESETS.map((voice) => voice.id),
+    recentProfileIds: ["avery--gb-female"],
+    recentAccents: ["en-GB"],
+  };
+  const first = createExaminerProfile(options);
+  const restored = createExaminerProfile(options);
+  assert.equal(restored.id, first.id);
+  assert.equal(restored.voiceId, first.voiceId);
+  assert.equal(restored.avatarId, first.avatarId);
+  assert.equal(restored.sessionId, first.sessionId);
+});
+
+test("examiner assignment only selects device-available voices", () => {
+  const profile = createExaminerProfile({
+    seed: "only-australian-male",
+    availableVoiceIds: ["au-male"],
+  });
+  assert.equal(profile.voiceId, "au-male");
+  assert.equal(profile.accent, "en-AU");
+  assert.equal(profile.genderPresentation, "male");
+});
+
+test("fixed practice voice and accent policies are respected", () => {
+  const fixed = createExaminerProfile({
+    seed: "fixed-practice",
+    availableVoiceIds: EXAMINER_VOICE_PRESETS.map((voice) => voice.id),
+    randomEnabled: false,
+    fixedVoiceId: "in-female",
+  });
+  assert.equal(fixed.voiceId, "in-female");
+  assert.equal(fixed.accent, "en-IN");
+
+  for (let index = 0; index < 30; index += 1) {
+    const british = createExaminerProfile({
+      seed: `british-${index}`,
+      availableVoiceIds: EXAMINER_VOICE_PRESETS.map((voice) => voice.id),
+      accentMode: "british",
+    });
+    assert.equal(british.accent, "en-GB");
+  }
+});
+
+test("recent accent weighting reduces immediate accent repetition", () => {
+  const availableVoiceIds = EXAMINER_VOICE_PRESETS.map((voice) => voice.id);
+  let baselineBritish = 0;
+  let recentBritish = 0;
+  for (let index = 0; index < 400; index += 1) {
+    if (createExaminerProfile({ seed: `base-${index}`, availableVoiceIds }).accent === "en-GB") baselineBritish += 1;
+    if (createExaminerProfile({ seed: `recent-${index}`, availableVoiceIds, recentAccents: ["en-GB"] }).accent === "en-GB") recentBritish += 1;
+  }
+  assert.ok(recentBritish < baselineBritish * 0.65, `${recentBritish} should be materially lower than ${baselineBritish}`);
+});
+
+test("avatar appearance is not fixed to one accent", () => {
+  const availableVoiceIds = EXAMINER_VOICE_PRESETS.map((voice) => voice.id);
+  const accentsByAvatar = new Map();
+  for (let index = 0; index < 250; index += 1) {
+    const profile = createExaminerProfile({ seed: `independent-${index}`, availableVoiceIds });
+    const accents = accentsByAvatar.get(profile.avatarId) ?? new Set();
+    accents.add(profile.accent);
+    accentsByAvatar.set(profile.avatarId, accents);
+  }
+  assert.ok([...accentsByAvatar.values()].some((accents) => accents.size >= 3));
 });

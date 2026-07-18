@@ -1,8 +1,25 @@
-import type { ExamPlan, ExamState, ScoreReport, SpeechMetrics } from "./core.mjs";
+import type {
+  ExamPlan,
+  ExaminerAccent,
+  ExaminerProfile,
+  ExaminerVoiceId,
+  ExamState,
+  ScoreReport,
+  SpeechMetrics,
+} from "./core.mjs";
 
-export type Screen = "home" | "onboarding" | "setup" | "exam" | "practice" | "history" | "trends" | "settings" | "results";
+export type Screen =
+  | "home"
+  | "onboarding"
+  | "setup"
+  | "exam"
+  | "practice"
+  | "history"
+  | "trends"
+  | "settings"
+  | "results";
 export type ProviderMode = "mock" | "openai";
-export type Accent = "en-GB" | "en-US" | "en-AU";
+export type Accent = ExaminerAccent;
 
 export interface UserSettings {
   displayName: string;
@@ -14,6 +31,10 @@ export interface UserSettings {
   provider: ProviderMode;
   theme: "light" | "dark" | "system";
   speechRate: number;
+  practiceVoiceId: ExaminerVoiceId;
+  randomExaminer: boolean;
+  randomAccentMode: "all" | "familiar" | "british";
+  excludedAccents: Accent[];
   onboarded: boolean;
 }
 
@@ -71,6 +92,12 @@ export interface HistoryRecord {
   durationSec: number;
   retried: boolean;
   selfRating?: number;
+  examinerProfileId?: string;
+  examinerDisplayName?: string;
+  examinerAccent?: Accent;
+  examinerVoiceId?: ExaminerVoiceId;
+  examinerAvatarId?: string;
+  accentEase?: "easy" | "manageable" | "challenging";
 }
 
 export interface ExamCheckpoint {
@@ -82,6 +109,7 @@ export interface ExamCheckpoint {
   segments: Omit<CapturedSegment, "blob" | "audioUrl">[];
   notes: string;
   elapsedSec: number;
+  examinerProfile?: ExaminerProfile;
 }
 
 export const DEFAULT_SETTINGS: UserSettings = {
@@ -94,5 +122,9 @@ export const DEFAULT_SETTINGS: UserSettings = {
   provider: "mock",
   theme: "system",
   speechRate: 1,
+  practiceVoiceId: "gb-female",
+  randomExaminer: true,
+  randomAccentMode: "all",
+  excludedAccents: [],
   onboarded: false,
 };
