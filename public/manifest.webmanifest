@@ -1,0 +1,13 @@
+{
+  "name": "Vocalis AI IELTS Speaking Studio",
+  "short_name": "Vocalis",
+  "description": "AI IELTS speaking mock exams and focused practice",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#f3f1eb",
+  "theme_color": "#10253f",
+  "lang": "zh-CN",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
