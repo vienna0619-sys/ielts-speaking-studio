@@ -1,7 +1,7 @@
-const CACHE = "vocalis-shell-v2";
+const CACHE = "vocalis-shell-v3";
 const asset = (path) => new URL(path, self.location.href).pathname;
 const HOME = asset("./");
-const SHELL = [HOME, asset("manifest.webmanifest"), asset("icon.svg"), asset("images/examiner.png")];
+const SHELL = [HOME, asset("manifest.webmanifest"), asset("icon.svg")];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(SHELL)).catch(() => undefined));
