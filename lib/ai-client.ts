@@ -44,7 +44,7 @@ function statusCode(status: number, code?: string): AiDiagnosticCode {
   if (code && code in USER_MESSAGES) return code as AiDiagnosticCode;
   if (status === 401) return "invalid_api_key";
   if (status === 403) return "project_permission_denied";
-  if (status === 404) return "route_missing";
+  if (status === 404 || status === 405) return "route_missing";
   if (status === 429) return "rate_limited";
   if (status === 504) return "timeout";
   return "provider_error";
@@ -62,7 +62,12 @@ async function postJson<T>(body: unknown, timeoutMs = 80_000): Promise<T> {
     });
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("application/json"))
-      throw new AiClientError(response.status === 404 ? "route_missing" : "invalid_response", response.status);
+      throw new AiClientError(
+        response.status === 404 || response.status === 405
+          ? "route_missing"
+          : "invalid_response",
+        response.status,
+      );
     const data = (await response.json()) as T & { code?: string; requestId?: string };
     if (!response.ok)
       throw new AiClientError(statusCode(response.status, data.code), response.status, data.requestId);
