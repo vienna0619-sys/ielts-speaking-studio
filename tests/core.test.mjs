@@ -118,14 +118,25 @@ test("examiner assignment is deterministic for a session seed", () => {
   assert.equal(restored.sessionId, first.sessionId);
 });
 
-test("examiner assignment only selects device-available voices", () => {
+test("examiner assignment only selects enabled device-available voices", () => {
   const profile = createExaminerProfile({
-    seed: "only-australian-male",
+    seed: "only-north-american-female",
+    availableVoiceIds: ["us-female"],
+  });
+  assert.equal(profile.voiceId, "us-female");
+  assert.equal(profile.accent, "en-US");
+  assert.equal(profile.genderPresentation, "female");
+});
+
+test("disabled unverified voices cannot enter the formal random pool", () => {
+  const profile = createExaminerProfile({
+    seed: "disabled-australian-male",
     availableVoiceIds: ["au-male"],
   });
-  assert.equal(profile.voiceId, "au-male");
-  assert.equal(profile.accent, "en-AU");
-  assert.equal(profile.genderPresentation, "male");
+  assert.equal(profile.voiceId, "gb-female");
+  assert.equal(profile.accent, "en-GB");
+  assert.equal(EXAMINER_VOICE_PRESETS.find((voice) => voice.id === "au-male")?.enabled, false);
+  assert.equal(EXAMINER_VOICE_PRESETS.find((voice) => voice.id === "in-male")?.enabled, false);
 });
 
 test("fixed practice voice and accent policies are respected", () => {
@@ -133,10 +144,19 @@ test("fixed practice voice and accent policies are respected", () => {
     seed: "fixed-practice",
     availableVoiceIds: EXAMINER_VOICE_PRESETS.map((voice) => voice.id),
     randomEnabled: false,
+    fixedVoiceId: "gb-male",
+  });
+  assert.equal(fixed.voiceId, "gb-male");
+  assert.equal(fixed.accent, "en-GB");
+
+  const disabledFixed = createExaminerProfile({
+    seed: "disabled-fixed-practice",
+    availableVoiceIds: EXAMINER_VOICE_PRESETS.map((voice) => voice.id),
+    randomEnabled: false,
     fixedVoiceId: "in-female",
   });
-  assert.equal(fixed.voiceId, "in-female");
-  assert.equal(fixed.accent, "en-IN");
+  assert.equal(disabledFixed.voiceId, "gb-female");
+  assert.equal(disabledFixed.accent, "en-GB");
 
   for (let index = 0; index < 30; index += 1) {
     const british = createExaminerProfile({
@@ -168,5 +188,5 @@ test("avatar appearance is not fixed to one accent", () => {
     accents.add(profile.accent);
     accentsByAvatar.set(profile.avatarId, accents);
   }
-  assert.ok([...accentsByAvatar.values()].some((accents) => accents.size >= 3));
+  assert.ok([...accentsByAvatar.values()].some((accents) => accents.size >= 2));
 });

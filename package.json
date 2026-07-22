@@ -14,13 +14,16 @@
     "lint": "bash scripts/sites-env.sh -- eslint . --ignore-pattern dist --ignore-pattern gh-pages-dist --ignore-pattern .next",
     "typecheck": "tsc --noEmit",
     "validate:artifact": "bash scripts/validate-artifact.sh",
-    "test:unit": "node --test tests/*.test.mjs",
-    "test": "npm run test:unit"
+    "test:unit": "node --test tests/core.test.mjs",
+    "test:integration": "node --experimental-strip-types --test tests/integration.test.mjs",
+    "test": "npm run test:unit && npm run test:integration"
   },
   "dependencies": {
     "next": "16.2.6",
+    "openai": "^6.48.0",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "zod": "^4.3.6"
   },
   "devDependencies": {
     "@cloudflare/vite-plugin": "1.37.1",

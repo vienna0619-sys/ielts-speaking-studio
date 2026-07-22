@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   INTRODUCTION_QUESTIONS,
+  EXAMINER_AVATARS,
   EXAMINER_VOICE_PRESETS,
   PART1_TOPICS,
   PART2_SETS,
@@ -17,7 +18,6 @@ import {
   movingAverage,
   nextCountdown,
   prependHistoryRecord,
-  providerErrorStatus,
   timerReachedLimit,
   transitionExam,
   type ExamPlan,
@@ -38,20 +38,36 @@ import {
 } from "@/lib/types";
 import {
   clearCheckpoint,
-  deleteRecordAudio,
+  deleteHistoryData,
   loadAudioBlob,
   loadCheckpoint,
   loadHistory,
+  loadReportEnvelope,
+  loadExpressionLibrary,
   loadRecentTopicIds,
   loadRecentExaminerUsage,
   loadSettings,
   saveAudioBlob,
   saveCheckpoint,
   saveHistory,
+  saveReportEnvelope,
+  saveExpressionLibrary,
   saveRecentTopicIds,
   saveRecentExaminerUsage,
   saveSettings,
 } from "@/lib/storage";
+import {
+  appendReportVersion,
+  createReportSnapshot,
+  REPORT_DATA_VERSION,
+  type ReportEnvelope,
+} from "@/lib/reporting";
+import {
+  buildLongTermSignals,
+  buildPersonalRecommendations,
+  mergeExpressionLibrary,
+  type ExpressionLibraryItem,
+} from "@/lib/recommendations";
 import {
   createMicrophoneSession,
   speakExaminer,
@@ -71,16 +87,26 @@ import {
 } from "@/lib/examiner-voices";
 import {
   AudioMeter,
-  ExaminerAvatar,
   type ExaminerActivity,
 } from "./ExaminerAvatar";
 import { Icon, type IconName } from "./Icons";
 import { VoiceSettings } from "./VoiceSettings";
+import { MockExamExaminer } from "./MockExamExaminer";
+import { PracticeExaminer } from "./PracticeExaminer";
+import { HistoryReportDetail } from "./HistoryReportDetail";
+import { ExpressionLibraryView } from "./ExpressionLibraryView";
+import {
+  diagnoseOpenAi,
+  diagnosticMessage,
+  evaluateWithOpenAi,
+} from "@/lib/ai-client";
 
 const DISCLAIMER =
   "本结果由AI根据公开的IELTS评分标准估算，仅供练习参考，不是官方雅思成绩，也不能保证与真人考官评分完全一致。";
 const SESSION_NOW = Date.now();
-const ALL_VOICE_IDS = EXAMINER_VOICE_PRESETS.map((voice) => voice.id);
+const ALL_VOICE_IDS = EXAMINER_VOICE_PRESETS.filter(
+  (voice) => voice.enabled && voice.qualityStatus === "verified",
+).map((voice) => voice.id);
 const DEFAULT_EXAMINER_PROFILE = createExaminerProfile({
   seed: "default-examiner",
   randomEnabled: false,
@@ -108,8 +134,11 @@ function storedSegment(
     question: segment.question,
     text: segment.text,
     startedAt: segment.startedAt,
+    endedAt: segment.endedAt,
     durationSec: segment.durationSec,
     longPauses: segment.longPauses,
+    transcriptConfidence: segment.transcriptConfidence,
+    transcriptSource: segment.transcriptSource,
   };
 }
 
@@ -269,6 +298,11 @@ export default function SpeakingStudio() {
   const [screen, setScreen] = useState<Screen>("home");
   const [settings, setSettingsState] = useState<UserSettings>(DEFAULT_SETTINGS);
   const [history, setHistory] = useState<HistoryRecord[]>([]);
+  const [selectedHistory, setSelectedHistory] = useState<HistoryRecord | null>(null);
+  const [historyEnvelope, setHistoryEnvelope] = useState<ReportEnvelope | null>(null);
+  const [selectedVersionId, setSelectedVersionId] = useState("");
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [expressionLibrary, setExpressionLibrary] = useState<ExpressionLibraryItem[]>([]);
   const [checkpoint, setCheckpoint] = useState<ExamCheckpoint | null>(null);
   const [micStatus, setMicStatus] = useState<MicStatus>("unchecked");
   const [level, setLevel] = useState(0);
@@ -353,6 +387,7 @@ export default function SpeakingStudio() {
     const storedSettings = loadSettings();
     setSettingsState(storedSettings);
     setHistory(loadHistory());
+    void loadExpressionLibrary().then(setExpressionLibrary).catch(() => setError("表达库暂时无法从本机读取。"));
     setCheckpoint(loadCheckpoint());
     setOnline(navigator.onLine);
     if (!storedSettings.onboarded) setScreen("onboarding");
@@ -622,6 +657,7 @@ export default function SpeakingStudio() {
       stopStoredPlayback();
       try {
         await speakExaminer(text, {
+          examinerProfileId: profile.id,
           provider: settings.provider,
           accent: profile.accent,
           voiceId: profile.voiceId,
@@ -686,29 +722,24 @@ export default function SpeakingStudio() {
     [speak],
   );
 
-  const checkProvider = useCallback(async () => {
+  const checkProvider = useCallback(async (forceOpenAi = false) => {
     if (!online) {
       setProviderReady(false);
       setError("当前网络已断开。Mock 模式仍可使用浏览器本地语音。 ");
       return;
     }
-    if (settings.provider === "mock") {
+    if (settings.provider === "mock" && !forceOpenAi) {
       setProviderReady(true);
       setNotice("Mock 服务可用：语音和评分在本地演示");
       return;
     }
     try {
-      const response = await fetch("/api/ai", { cache: "no-store" });
-      const data = (await response.json()) as { configured?: boolean };
-      setProviderReady(Boolean(response.ok && data.configured));
-      if (!data.configured)
-        setError(
-          "服务端尚未配置 OPENAI_API_KEY。可在设置中切换到 Mock 模式。 ",
-        );
-      else setNotice("OpenAI 服务端配置已就绪");
-    } catch {
+      const diagnostic = await diagnoseOpenAi();
+      setProviderReady(diagnostic.connected);
+      setNotice(`${diagnostic.message} 模型：${diagnostic.model} · ${diagnostic.elapsedMs}ms`);
+    } catch (providerError) {
       setProviderReady(false);
-      setError("无法连接 AI 服务。当前考试状态会保留。 ");
+      setError(diagnosticMessage(providerError));
     }
   }, [online, settings.provider]);
 
@@ -806,17 +837,56 @@ export default function SpeakingStudio() {
         mainErrors: [feedback.focus],
         durationSec: segment.durationSec,
         retried: practiceFeedback !== null,
-        examinerProfileId: practiceProfile.id,
-        examinerDisplayName: practiceProfile.displayName,
+        reportVersion: REPORT_DATA_VERSION,
+        reportComplete: false,
+        scoringProvider: "mock",
+        scoringModel: "local-practice-v2",
+        scoredAt: new Date().toISOString(),
+        reanalysisCount: 0,
+        examinerProfileId: `practice:${practiceProfile.voiceId}`,
+        examinerDisplayName: "Practice Coach Avery",
         examinerAccent: practiceProfile.accent,
         examinerVoiceId: practiceProfile.voiceId,
-        examinerAvatarId: practiceProfile.avatarId,
+        examinerAvatarId: "avery",
       };
       setHistory((current) => {
         const next = prependHistoryRecord(current, record);
         saveHistory(next);
         return next;
       });
+      const report = { ...mockAnalysis([segment], plan), overall: feedback.band };
+      const recommendations = buildPersonalRecommendations(
+        report,
+        [segment],
+        record.id,
+        settings.targetBand,
+      );
+      const practiceExaminer = {
+        ...practiceProfile,
+        avatarId: "avery",
+        displayName: "Practice Coach Avery",
+        appearanceProfile: "cartoon-practice",
+      };
+      const snapshot = createReportSnapshot({
+        record,
+        report,
+        segments: [storedSegment(segment)],
+        examinerProfile: practiceExaminer,
+        scoringModel: "local-practice-v2",
+        recommendations,
+      });
+      void saveReportEnvelope(appendReportVersion(null, snapshot))
+        .then(async () => {
+          const nextLibrary = mergeExpressionLibrary(expressionLibrary, recommendations);
+          await saveExpressionLibrary(nextLibrary);
+          setExpressionLibrary(nextLibrary);
+          setHistory((current) => {
+            const next = current.map((item) => item.id === record.id ? { ...item, reportComplete: true } : item);
+            saveHistory(next);
+            return next;
+          });
+        })
+        .catch(() => setError("练习摘要已保存，但完整报告写入本机失败。"));
     },
     [
       practicePart,
@@ -825,6 +895,9 @@ export default function SpeakingStudio() {
       settings.saveRecordings,
       practiceFeedback,
       practiceProfile,
+      plan,
+      settings.targetBand,
+      expressionLibrary,
     ],
   );
 
@@ -838,9 +911,17 @@ export default function SpeakingStudio() {
     try {
       const captured = await controller.stop();
       let text = captured.text;
+      let transcriptSource: CapturedSegment["transcriptSource"] = text
+        ? "browser"
+        : "missing";
+      let transcriptConfidence: CapturedSegment["transcriptConfidence"] = text
+        ? "medium"
+        : "low";
       if (settings.provider === "openai") {
         try {
           text = await transcribeWithProvider(captured.blob);
+          transcriptSource = text ? "openai" : "missing";
+          transcriptConfidence = text ? "high" : "low";
         } catch (transcriptionError) {
           setError(
             transcriptionError instanceof Error
@@ -859,8 +940,11 @@ export default function SpeakingStudio() {
         startedAt: new Date(
           Date.now() - captured.durationSec * 1000,
         ).toISOString(),
+        endedAt: new Date().toISOString(),
         durationSec: captured.durationSec,
         longPauses: longPauseCountRef.current,
+        transcriptSource,
+        transcriptConfidence,
         blob: captured.blob,
         audioUrl: URL.createObjectURL(captured.blob),
       };
@@ -992,7 +1076,9 @@ export default function SpeakingStudio() {
   ]);
 
   const saveExamHistory = useCallback(
-    (report: AnalysisReport) => {
+    async (report: AnalysisReport) => {
+      const scoredAt = new Date().toISOString();
+      const scoringModel = report.provider === "openai" ? "gpt-5.6-terra" : "local-mock-v2";
       const record: HistoryRecord = {
         id: plan.comboId,
         date: new Date().toISOString(),
@@ -1011,20 +1097,52 @@ export default function SpeakingStudio() {
         mainErrors: report.priorities,
         durationSec: elapsedSec,
         retried: false,
+        reportVersion: REPORT_DATA_VERSION,
+        reportComplete: false,
+        scoringProvider: report.provider,
+        scoringModel,
+        scoredAt,
+        reanalysisCount: 0,
         examinerProfileId: examinerProfile.id,
         examinerDisplayName: examinerProfile.displayName,
         examinerAccent: examinerProfile.accent,
         examinerVoiceId: examinerProfile.voiceId,
         examinerAvatarId: examinerProfile.avatarId,
       };
-      setHistory((current) => {
-        const next = prependHistoryRecord(current, record);
-        saveHistory(next);
-        return next;
-      });
+      const saveIndex = (nextRecord: HistoryRecord) =>
+        setHistory((current) => {
+          const next = prependHistoryRecord(current, nextRecord);
+          saveHistory(next);
+          return next;
+        });
+      saveIndex(record);
+      try {
+        const recommendations = buildPersonalRecommendations(
+          report,
+          segments,
+          record.id,
+          settings.targetBand,
+        );
+        const snapshot = createReportSnapshot({
+          record,
+          report,
+          segments: segments.map(storedSegment),
+          examinerProfile,
+          examPlan: plan,
+          scoringModel,
+          recommendations,
+        });
+        await saveReportEnvelope(appendReportVersion(null, snapshot));
+        const nextLibrary = mergeExpressionLibrary(expressionLibrary, recommendations);
+        await saveExpressionLibrary(nextLibrary);
+        setExpressionLibrary(nextLibrary);
+        saveIndex({ ...record, reportComplete: true });
+      } catch {
+        setError("评分已生成，但完整报告写入本机失败；摘要仍已保留，请检查浏览器存储空间。");
+      }
       saveRecentTopicIds([...record.topics, ...loadRecentTopicIds()]);
     },
-    [plan, settings.saveRecordings, segments, elapsedSec, examinerProfile],
+    [plan, settings.saveRecordings, settings.targetBand, segments, elapsedSec, examinerProfile, expressionLibrary],
   );
 
   const analyseSession = useCallback(
@@ -1037,12 +1155,10 @@ export default function SpeakingStudio() {
         let report: AnalysisReport;
         if (settings.provider === "openai" && !forceMock) {
           const metrics = calculateSpeechMetrics(segments);
-          const response = await fetch("/api/ai", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              operation: "evaluate",
-              payload: {
+          const cloud = await evaluateWithOpenAi<Omit<
+            AnalysisReport,
+            "metrics" | "provider" | "disclaimer"
+          >>({
                 examPlan: {
                   comboId: plan.comboId,
                   part1Topics: plan.part1.map((topic) => topic.topic),
@@ -1052,15 +1168,7 @@ export default function SpeakingStudio() {
                 segments: segments.map(storedSegment),
                 metrics,
                 note: "Pronunciation evidence is limited to timing and transcription reliability; mark phoneme claims low confidence.",
-              },
-            }),
-          });
-          if (!response.ok)
-            throw new Error(providerErrorStatus(response.status));
-          const cloud = (await response.json()) as Omit<
-            AnalysisReport,
-            "metrics" | "provider" | "disclaimer"
-          >;
+              }, `score:${plan.comboId}:v1`);
           report = {
             ...cloud,
             metrics,
@@ -1072,7 +1180,7 @@ export default function SpeakingStudio() {
           report = mockAnalysis(segments, plan);
         }
         setAnalysisReport(report);
-        saveExamHistory(report);
+        await saveExamHistory(report);
         clearCheckpoint();
         setCheckpoint(null);
         setExamState(transitionExam("ANALYSING", "ANALYSIS_COMPLETE"));
@@ -1081,7 +1189,7 @@ export default function SpeakingStudio() {
         analysisRunRef.current = "";
         setAnalysisError(
           analysisFailure instanceof Error
-            ? analysisFailure.message
+            ? diagnosticMessage(analysisFailure) || analysisFailure.message
             : "分析失败，考试内容已保留。 ",
         );
       }
@@ -1367,14 +1475,152 @@ export default function SpeakingStudio() {
     [segments, stopStoredPlayback],
   );
 
+  const openHistoryRecord = useCallback(async (record: HistoryRecord) => {
+    stopStoredPlayback();
+    setSelectedHistory(record);
+    setHistoryEnvelope(null);
+    setSelectedVersionId("");
+    setHistoryLoading(true);
+    setError("");
+    setScreen("history-detail");
+    try {
+      const envelope = await loadReportEnvelope(record.id);
+      setHistoryEnvelope(envelope);
+      if (envelope)
+        setSelectedVersionId(envelope.originalVersionId || envelope.versions[0]?.id || "");
+    } catch {
+      setError("完整报告暂时无法从本机数据库读取；历史摘要仍然保留。");
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [stopStoredPlayback]);
+
+  const reanalyzeHistory = useCallback(async () => {
+    if (!selectedHistory || !historyEnvelope) return;
+    const source = historyEnvelope.versions.find((item) => item.id === selectedVersionId)
+      ?? historyEnvelope.versions[0];
+    if (!source || historyLoading) return;
+    setHistoryLoading(true);
+    setError("");
+    setNotice("");
+    try {
+      let report: AnalysisReport;
+      let scoringModel = "local-mock-v2";
+      if (settings.provider === "openai") {
+        const metrics = calculateSpeechMetrics(source.segments);
+        const cloud = await evaluateWithOpenAi<Omit<
+          AnalysisReport,
+          "metrics" | "provider" | "disclaimer"
+        >>({
+          examPlan: source.examPlan
+            ? {
+                comboId: source.examPlan.comboId,
+                part1Topics: source.examPlan.part1.map((topic) => topic.topic),
+                part2Topic: source.examPlan.part2.mainTopic,
+                part3Themes: source.examPlan.part2.relatedPart3Themes,
+              }
+            : { mode: source.mode, title: selectedHistory.title },
+          segments: source.segments,
+          metrics,
+          note: "This is a user-requested reanalysis of a saved report. Pronunciation evidence is limited when only transcripts are available.",
+        }, `reanalyze:${selectedHistory.id}:v${historyEnvelope.versions.length + 1}`);
+        report = { ...cloud, metrics, provider: "openai", disclaimer: DISCLAIMER };
+        scoringModel = "gpt-5.6-terra";
+      } else {
+        report = mockAnalysis(source.segments, source.examPlan ?? plan);
+      }
+      const recommendations = buildPersonalRecommendations(
+        report,
+        source.segments,
+        selectedHistory.id,
+        settings.targetBand,
+      );
+      const snapshot = createReportSnapshot({
+        record: selectedHistory,
+        report,
+        segments: source.segments,
+        examinerProfile: source.examinerProfile,
+        examPlan: source.examPlan,
+        scoringModel,
+        recommendations,
+        analysisKind: "reanalysis",
+        basedOnVersionId: source.id,
+      });
+      const nextEnvelope = appendReportVersion(historyEnvelope, snapshot);
+      await saveReportEnvelope(nextEnvelope);
+      const nextLibrary = mergeExpressionLibrary(expressionLibrary, recommendations);
+      await saveExpressionLibrary(nextLibrary);
+      setExpressionLibrary(nextLibrary);
+      setHistoryEnvelope(nextEnvelope);
+      setSelectedVersionId(snapshot.id);
+      const updatedRecord = {
+        ...selectedHistory,
+        reanalysisCount: (selectedHistory.reanalysisCount ?? 0) + 1,
+      };
+      setSelectedHistory(updatedRecord);
+      setHistory((current) => {
+        const next = current.map((item) => item.id === updatedRecord.id ? updatedRecord : item);
+        saveHistory(next);
+        return next;
+      });
+      setNotice("新分析版本已保存；原始报告没有被覆盖。");
+    } catch (reanalyzeError) {
+      setError(diagnosticMessage(reanalyzeError));
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [
+    selectedHistory,
+    historyEnvelope,
+    selectedVersionId,
+    historyLoading,
+    settings.provider,
+    settings.targetBand,
+    plan,
+    expressionLibrary,
+  ]);
+
+  const updateExpressionItem = useCallback(
+    (id: string, changes: Partial<ExpressionLibraryItem>) => {
+      setExpressionLibrary((current) => {
+        const next = current.map((item) => item.id === id ? { ...item, ...changes } : item);
+        void saveExpressionLibrary(next).catch(() => setError("表达库修改无法写入本机数据库。"));
+        return next;
+      });
+    },
+    [],
+  );
+
+  const deleteExpressionItem = useCallback((id: string) => {
+    if (!window.confirm("从表达库删除这条推荐？历史报告中的原始推荐快照仍会保留。")) return;
+    setExpressionLibrary((current) => {
+      const next = current.filter((item) => item.id !== id);
+      void saveExpressionLibrary(next).catch(() => setError("表达库删除无法写入本机数据库。"));
+      return next;
+    });
+  }, []);
+
+  const speakExpression = useCallback((text: string) => {
+    void speak(text, practiceProfile);
+  }, [speak, practiceProfile]);
+
+  const openExpressionSource = useCallback((recordId: string) => {
+    const record = history.find((item) => item.id === recordId);
+    if (record) void openHistoryRecord(record);
+    else setError("这条推荐引用的旧历史记录已被删除。");
+  }, [history, openHistoryRecord]);
+
   const removeHistory = useCallback(
     async (record: HistoryRecord) => {
-      if (!window.confirm("删除这条练习记录及其本地录音？此操作不可撤销。"))
+      const deletionScope = record.recordingSaved
+        ? "完整报告、文字稿索引以及该记录的全部本地录音"
+        : "完整报告与文字稿索引（本次未保存录音）";
+      if (!window.confirm(`将删除：${deletionScope}。表达库中已加入的学习项目不会自动删除。此操作不可撤销。`))
         return;
       const next = history.filter((item) => item.id !== record.id);
       setHistory(next);
       saveHistory(next);
-      if (record.recordingSaved) await deleteRecordAudio(record);
+      await deleteHistoryData(record);
     },
     [history],
   );
@@ -1409,6 +1655,7 @@ export default function SpeakingStudio() {
     { id: "home", label: "首页", icon: "home" },
     { id: "practice", label: "专项练习", icon: "practice" },
     { id: "history", label: "历史成绩", icon: "history" },
+    { id: "expressions", label: "我的表达库", icon: "note" },
     { id: "trends", label: "学习趋势", icon: "trend" },
     { id: "settings", label: "设置", icon: "settings" },
   ];
@@ -1722,10 +1969,9 @@ export default function SpeakingStudio() {
               </aside>
             )}
             <div className="examiner-column">
-              <ExaminerAvatar
+              <MockExamExaminer
                 activity={examinerActivity}
                 speechLevel={examinerSpeechLevel}
-                viseme={examinerViseme}
                 avatarId={examinerProfile.avatarId}
                 displayName={examinerProfile.displayName}
               />
@@ -1878,7 +2124,7 @@ export default function SpeakingStudio() {
             <p>{analysisReport.disclaimer}</p>
           </div>
           <section className="panel result-examiner-card">
-            <ExaminerAvatar
+            <MockExamExaminer
               compact
               activity="idle"
               avatarId={examinerProfile.avatarId}
@@ -2171,6 +2417,31 @@ export default function SpeakingStudio() {
   }
 
   const renderMain = () => {
+    if (screen === "history-detail" && selectedHistory)
+      return (
+        <HistoryReportDetail
+          record={selectedHistory}
+          envelope={historyEnvelope}
+          selectedVersionId={selectedVersionId}
+          loading={historyLoading}
+          onBack={() => setScreen("history")}
+          onVersionChange={setSelectedVersionId}
+          onReplay={(segmentId) => void playStoredAudio(segmentId)}
+          onReanalyze={() => void reanalyzeHistory()}
+        />
+      );
+
+    if (screen === "expressions")
+      return (
+        <ExpressionLibraryView
+          items={expressionLibrary}
+          onUpdate={updateExpressionItem}
+          onDelete={deleteExpressionItem}
+          onSpeak={speakExpression}
+          onOpenSource={openExpressionSource}
+        />
+      );
+
     if (screen === "home")
       return (
         <>
@@ -2381,11 +2652,10 @@ export default function SpeakingStudio() {
                   : "本次考试使用你设置的固定考官声音；开始后整场保持不变。"}
               </p>
             </div>
-            <ExaminerAvatar
+            <MockExamExaminer
               compact
               activity={examinerActivity === "speaking" ? "speaking" : "idle"}
               speechLevel={examinerSpeechLevel}
-              viseme={examinerViseme}
               avatarId={examinerProfile.avatarId}
               displayName={examinerProfile.displayName}
             />
@@ -2588,7 +2858,7 @@ export default function SpeakingStudio() {
                     selectPracticeVoice(event.target.value as ExaminerVoiceId)
                   }
                 >
-                  {EXAMINER_VOICE_PRESETS.map((voice) => (
+                  {EXAMINER_VOICE_PRESETS.filter((voice) => voice.enabled).map((voice) => (
                     <option value={voice.id} key={voice.id}>
                       {ACCENT_LABELS[voice.accent]} · {voice.genderPresentation === "female" ? "女声" : "男声"}
                     </option>
@@ -2719,13 +2989,11 @@ export default function SpeakingStudio() {
             <div className="practice-workspace">
               <article className="panel practice-question">
                 <div className="practice-examiner">
-                  <ExaminerAvatar
+                  <PracticeExaminer
                     compact
                     activity={examinerActivity}
                     speechLevel={examinerSpeechLevel}
                     viseme={examinerViseme}
-                    avatarId={practiceProfile.avatarId}
-                    displayName={practiceProfile.displayName}
                   />
                   <div>
                     <span className="eyebrow">
@@ -2958,6 +3226,17 @@ export default function SpeakingStudio() {
                       </small>
                     )}
                     <p>{record.mainErrors[0] || "暂无主要问题记录"}</p>
+                    <div className="history-dimension-summary">
+                      {record.dimensions.map((dimension) => (
+                        <span key={dimension.key}>{dimension.label.slice(0, 3)} {dimension.band.toFixed(1)}</span>
+                      ))}
+                      <span className={record.scoringProvider === "openai" ? "real-score" : "mock-score"}>
+                        {record.scoringProvider === "openai" ? "OpenAI" : "Mock"}
+                      </span>
+                      <span>{record.recordingSaved ? "有录音" : "无录音"}</span>
+                      <span>{record.reportComplete ? "完整报告" : "旧版摘要"}</span>
+                      {(record.reanalysisCount ?? 0) > 0 && <span>已重析 {record.reanalysisCount} 次</span>}
+                    </div>
                   </div>
                   <div className="history-score">
                     <span>估分</span>
@@ -2965,6 +3244,12 @@ export default function SpeakingStudio() {
                     <small>{formatTime(record.durationSec)}</small>
                   </div>
                   <div className="history-actions">
+                    <button
+                      className="secondary compact-action"
+                      onClick={() => void openHistoryRecord(record)}
+                    >
+                      查看完整报告
+                    </button>
                     {record.recordingSaved && record.segments[0] && (
                       <button
                         className="icon-button"
@@ -3021,6 +3306,7 @@ export default function SpeakingStudio() {
         1,
         partCounts.reduce((a, b) => a + b, 0),
       );
+      const longTerm = buildLongTermSignals(history, expressionLibrary);
       return (
         <section className="page-section">
           <div className="page-heading simple">
@@ -3118,6 +3404,17 @@ export default function SpeakingStudio() {
                 </div>
               </div>
             </article>
+            <article className="panel long-term-language">
+              <div className="panel-title">
+                <div><span className="eyebrow">LONG-TERM LANGUAGE</span><h2>跨多次练习信号</h2></div>
+              </div>
+              <div className="signal-columns">
+                <div><strong>高频问题</strong>{longTerm.frequentIssues.length ? longTerm.frequentIssues.map(([issue, count]) => <p key={issue}>{issue}<small>{count} 次记录</small></p>) : <p>需要更多数据</p>}</div>
+                <div><strong>本周 5 个表达</strong>{longTerm.weeklyExpressions.length ? longTerm.weeklyExpressions.map((item) => <p key={item.id}>{item.expression}<small>{item.type}</small></p>) : <p>完成练习后生成</p>}</div>
+                <div><strong>已成功使用</strong>{longTerm.improvedExpressions.length ? longTerm.improvedExpressions.map((item) => <p key={item.id}>{item.expression}<small>{item.successfulUses} 次</small></p>) : <p>尚无已确认记录</p>}</div>
+              </div>
+              <button className="secondary" onClick={() => setScreen("expressions")}>打开我的表达库</button>
+            </article>
           </div>
         </section>
       );
@@ -3191,8 +3488,8 @@ export default function SpeakingStudio() {
                   }
                 >
                   {EXAMINER_VOICE_PRESETS.map((voice) => (
-                    <option value={voice.id} key={voice.id}>
-                      {ACCENT_LABELS[voice.accent]} · {voice.genderPresentation === "female" ? "女声" : "男声"}
+                    <option value={voice.id} key={voice.id} disabled={!voice.enabled}>
+                      {ACCENT_LABELS[voice.accent]} · {voice.verifiedGenderPresentation === "female" ? "已验证女声" : voice.verifiedGenderPresentation === "male" ? "已验证男声" : "未验证性别"}{voice.enabled ? "" : "（已停用）"}
                     </option>
                   ))}
                 </select>
@@ -3203,7 +3500,7 @@ export default function SpeakingStudio() {
             <div className="panel-title">
               <div>
                 <span className="eyebrow">AI PROVIDER</span>
-                <h2>语音与评分服务</h2>
+                <h2>OpenAI 评分</h2>
               </div>
               <Icon name="spark" />
             </div>
@@ -3225,12 +3522,22 @@ export default function SpeakingStudio() {
                 <i>{settings.provider === "openai" && <Icon name="check" />}</i>
               </button>
             </div>
+            <div className={`provider-status ${providerReady === true ? "ready" : providerReady === false ? "failed" : "untested"}`}>
+              <span>当前状态</span>
+              <strong>{providerReady === true ? "连接正常" : providerReady === false ? "连接失败 / 未配置" : "尚未测试"}</strong>
+              <small>当前评分提供商：{settings.provider === "openai" ? "OpenAI API（真实评分）" : "Mock（明确标记的本地估算）"}</small>
+              <small>默认模型：gpt-5.6-terra（可由服务端 OPENAI_TEXT_MODEL 覆盖）</small>
+            </div>
             <button
               className="secondary wide"
-              onClick={() => void checkProvider()}
+              onClick={() => void checkProvider(true)}
             >
-              检测当前服务
+              测试 OpenAI 连接
             </button>
+            <div className="privacy-note">
+              <Icon name="shield" />
+              <span>ChatGPT 登录或 Plus 订阅不等于 OpenAI API。真实评分需要服务端 API 密钥和单独的 API 额度，可能产生费用；密钥不会发送到浏览器。</span>
+            </div>
           </article>
           <article className="panel random-examiner-panel">
             <div className="panel-title">
@@ -3303,6 +3610,18 @@ export default function SpeakingStudio() {
             <p className="settings-hint">
               系统只从当前 provider 或设备真正可用的高质量声音中抽取，并降低最近三场重复组合的概率。人物外观与口音独立选择。
             </p>
+            <p className="settings-hint warning-text">澳洲和印度声音目前未通过性别、自然度与连续性验证，已从正式随机池停用，不会用 pitch 或 rate 伪造口音。</p>
+            <div className="available-examiner-grid">
+              {EXAMINER_AVATARS.filter((avatar) => avatar.enabled).map((avatar) => (
+                <MockExamExaminer
+                  key={avatar.id}
+                  compact
+                  activity="idle"
+                  avatarId={avatar.id}
+                  displayName={avatar.displayName}
+                />
+              ))}
+            </div>
           </article>
           <article className="panel">
             <div className="panel-title">
@@ -3515,7 +3834,7 @@ export default function SpeakingStudio() {
         </header>
         <main className="content">{renderMain()}</main>
         <nav className="mobile-nav">
-          {navItems.slice(0, 4).map((item) => (
+          {navItems.slice(0, 5).map((item) => (
             <button
               key={item.id}
               className={screen === item.id ? "active" : ""}

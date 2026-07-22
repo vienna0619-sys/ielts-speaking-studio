@@ -96,6 +96,9 @@ export interface BrowserVoiceOption {
   accent: ExaminerAccent;
   accentLabel: string;
   genderPresentation: "female" | "male";
+  verifiedGenderPresentation: "female" | "male" | null;
+  enabled: boolean;
+  qualityStatus: ExaminerVoicePreset["qualityStatus"];
   available: boolean;
   resolvedName: string;
   resolvedLang: string;
@@ -154,16 +157,22 @@ function bestForPreset(
   exactLocaleOnly = true,
 ) {
   const requested = normalizedLocale(preset.locale);
-  return (
-    voices
+  const candidates = voices
       .filter((voice) => !isNoveltyVoice(voice))
       .filter((voice) =>
         exactLocaleOnly
           ? normalizedLocale(voice.lang) === requested
           : normalizedLocale(voice.lang).startsWith("en"),
       )
-      .sort((a, b) => scoreVoice(b, preset) - scoreVoice(a, preset))[0] ?? null
-  );
+      .sort((a, b) => scoreVoice(b, preset) - scoreVoice(a, preset));
+  // Browser voices do not expose gender metadata. Formal options therefore
+  // use only names that have been explicitly reviewed for the requested
+  // presentation; an arbitrary same-locale default is not labelled as male or
+  // female. Disabled/unverified presets are never admitted to the exam pool.
+  if (preset.qualityStatus === "verified") {
+    return candidates.find((voice) => preferredNameIndex(voice, preset) >= 0) ?? null;
+  }
+  return candidates[0] ?? null;
 }
 
 function qualityFor(
@@ -191,8 +200,10 @@ export function resolveBrowserVoice(
   voices: SpeechSynthesisVoice[],
 ): ResolvedBrowserVoice | null {
   const preset = getVoicePreset(voiceId);
-  let voice = bestForPreset(voices, preset, true);
-  let resolvedPreset = preset;
+  let resolvedPreset = preset.enabled
+    ? preset
+    : (EXAMINER_VOICE_PRESETS.find((candidate) => candidate.id === "gb-female") ?? EXAMINER_VOICE_PRESETS[0]);
+  let voice = bestForPreset(voices, resolvedPreset, true);
 
   if (!voice) {
     const regionalBackup = EXAMINER_VOICE_PRESETS.find(
@@ -228,8 +239,8 @@ export function resolveBrowserVoice(
   const exactLocale =
     normalizedLocale(voice.lang) === normalizedLocale(preset.locale);
   const fallbackUsed = resolvedPreset.id !== preset.id || !exactLocale;
-  const message = fallbackUsed
-    ? `${preset.label} 在此设备上不可用，已自动改用 ${voice.name}（${voice.lang}）。`
+  const message = fallbackUsed || !preset.enabled
+    ? `${preset.label} ${preset.enabled ? "在此设备上不可用" : "尚未通过质量验证"}，已自动改用 ${voice.name}（${voice.lang}）。`
     : `已使用 ${voice.name}（${voice.lang}）。`;
   return {
     preset,
@@ -245,6 +256,26 @@ export function buildVoiceOptions(
   voices: SpeechSynthesisVoice[],
 ): BrowserVoiceOption[] {
   return EXAMINER_VOICE_PRESETS.map((preset) => {
+    if (!preset.enabled || preset.qualityStatus !== "verified") {
+      return {
+        id: preset.id,
+        label: preset.label,
+        accent: preset.accent,
+        accentLabel: ACCENT_LABELS[preset.accent],
+        genderPresentation: preset.genderPresentation,
+        verifiedGenderPresentation: preset.verifiedGenderPresentation,
+        enabled: false,
+        qualityStatus: preset.qualityStatus,
+        available: false,
+        resolvedName: "未启用",
+        resolvedLang: preset.locale,
+        providerLabel: "浏览器 Speech Synthesis",
+        localService: false,
+        quality: "unavailable",
+        fallbackUsed: false,
+        statusMessage: "该声音尚未通过真实性别、口音与流畅度验证，已从正式随机池停用。",
+      };
+    }
     const resolved = resolveBrowserVoice(preset.id, voices);
     if (!resolved) {
       return {
@@ -253,6 +284,9 @@ export function buildVoiceOptions(
         accent: preset.accent,
         accentLabel: ACCENT_LABELS[preset.accent],
         genderPresentation: preset.genderPresentation,
+        verifiedGenderPresentation: preset.verifiedGenderPresentation,
+        enabled: true,
+        qualityStatus: preset.qualityStatus,
         available: false,
         resolvedName: "未找到英语语音",
         resolvedLang: "—",
@@ -269,6 +303,9 @@ export function buildVoiceOptions(
       accent: preset.accent,
       accentLabel: ACCENT_LABELS[preset.accent],
       genderPresentation: preset.genderPresentation,
+      verifiedGenderPresentation: preset.verifiedGenderPresentation,
+      enabled: true,
+      qualityStatus: preset.qualityStatus,
       available: resolved.exactLocale && resolved.quality !== "fallback",
       resolvedName: resolved.voice.name,
       resolvedLang: resolved.voice.lang,

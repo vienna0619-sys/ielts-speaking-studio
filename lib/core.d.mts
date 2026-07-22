@@ -75,13 +75,23 @@ export type ExaminerGenderPresentation = "female" | "male";
 export interface ExaminerVoicePreset {
   id: ExaminerVoiceId;
   label: string;
+  provider: "adaptive";
+  voiceId: ExaminerVoiceId;
   accent: ExaminerAccent;
   locale: ExaminerAccent;
   genderPresentation: ExaminerGenderPresentation;
+  verifiedGenderPresentation: ExaminerGenderPresentation | null;
   speakingRate: number;
   pitch: number;
   volume: number;
-  qualityLevel: "high";
+  qualityLevel: "high" | "unverified";
+  qualityStatus:
+    | "verified"
+    | "disabled-unverified-gender"
+    | "disabled-unverified-accent"
+    | "disabled-unverified-gender-accent"
+    | "disabled-quality"
+    | "disabled-quality-and-gender";
   enabled: boolean;
   supportedModes: ("mock-exam" | "practice")[];
   fallbackVoiceId: ExaminerVoiceId;
@@ -94,6 +104,8 @@ export interface ExaminerAvatarDefinition {
   appearanceProfile: string;
   genderPresentation: ExaminerGenderPresentation;
   estimatedAgeRange: string;
+  appearanceCategory: string;
+  spriteRow: number;
   enabled: boolean;
 }
 
@@ -112,7 +124,7 @@ export interface ExaminerProfile {
   speakingRate: number;
   pitch: number;
   volume: number;
-  qualityLevel: "high";
+  qualityLevel: "high" | "unverified";
   enabled: boolean;
   supportedModes: ("mock-exam" | "practice")[];
   fallbackVoiceId: ExaminerVoiceId;

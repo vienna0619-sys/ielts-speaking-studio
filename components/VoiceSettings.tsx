@@ -46,13 +46,18 @@ export function VoiceSettings({
                 type="radio"
                 name="examiner-voice"
                 checked={selectedId === option.id}
+                disabled={!option.enabled}
                 onChange={() => onSelect(option.id)}
               />
               <span className="voice-radio" aria-hidden="true" />
               <span className="voice-copy">
                 <strong>{option.accentLabel}</strong>
                 <span>
-                  {option.genderPresentation === "female" ? "女声" : "男声"} ·{" "}
+                  {option.verifiedGenderPresentation === "female"
+                    ? "已验证女声"
+                    : option.verifiedGenderPresentation === "male"
+                      ? "已验证男声"
+                      : "未验证性别"} ·{" "}
                   {remote ? "服务端自然语音" : option.resolvedName}
                 </span>
               </span>
@@ -73,7 +78,9 @@ export function VoiceSettings({
                     : "voice-fallback"
                 }
               >
-                {remote
+                {!option.enabled
+                  ? "已停用"
+                  : remote
                   ? "服务端可用"
                   : option.available
                     ? "当前可用"
@@ -84,7 +91,7 @@ export function VoiceSettings({
               className="voice-preview"
               onClick={() => onPreview(option.id)}
               disabled={
-                previewingId === option.id ||
+                !option.enabled || previewingId === option.id ||
                 (!remote && option.quality === "unavailable")
               }
             >

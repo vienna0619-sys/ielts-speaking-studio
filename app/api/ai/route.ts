@@ -6,7 +6,7 @@ export const runtime = "nodejs";
 function errorResponse(error: unknown) {
   if (error instanceof ProviderError)
     return NextResponse.json(
-      { error: error.message },
+      { error: error.message, code: error.code, requestId: error.requestId },
       { status: error.status },
     );
   return NextResponse.json(
@@ -74,6 +74,9 @@ export async function POST(request: Request) {
     }
     if (body.operation === "evaluate") {
       return NextResponse.json(await openAiProvider.evaluate(body.payload));
+    }
+    if (body.operation === "diagnose") {
+      return NextResponse.json(await openAiProvider.diagnose());
     }
     return NextResponse.json(
       { error: "Unsupported operation." },

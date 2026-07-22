@@ -15,6 +15,8 @@ export type Screen =
   | "exam"
   | "practice"
   | "history"
+  | "history-detail"
+  | "expressions"
   | "trends"
   | "settings"
   | "results";
@@ -44,8 +46,11 @@ export interface CapturedSegment {
   question: string;
   text: string;
   startedAt: string;
+  endedAt?: string;
   durationSec: number;
   longPauses: number;
+  transcriptConfidence?: "low" | "medium" | "high";
+  transcriptSource?: "browser" | "openai" | "missing";
   blob?: Blob;
   audioUrl?: string;
 }
@@ -91,6 +96,12 @@ export interface HistoryRecord {
   mainErrors: string[];
   durationSec: number;
   retried: boolean;
+  reportVersion?: number;
+  reportComplete?: boolean;
+  scoringProvider?: ProviderMode;
+  scoringModel?: string;
+  scoredAt?: string;
+  reanalysisCount?: number;
   selfRating?: number;
   examinerProfileId?: string;
   examinerDisplayName?: string;

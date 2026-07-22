@@ -49,6 +49,7 @@ export type SpeechViseme = "rest" | "open" | "wide" | "round";
 export type ExaminerSpeechState = "idle" | "thinking" | "speaking";
 
 export interface ExaminerSpeechOptions {
+  examinerProfileId?: string;
   provider: ProviderMode;
   accent: Accent;
   voiceId: ExaminerVoiceId;
@@ -67,6 +68,14 @@ export interface ExaminerSpeechProvider {
 }
 
 let activeSpeechStop: (() => void) | null = null;
+
+function voiceDebug(details: Record<string, unknown>) {
+  if (typeof window === "undefined") return;
+  const enabled =
+    window.localStorage.getItem("vocalis.debug.voice") === "1" ||
+    new URLSearchParams(window.location.search).get("debugVoice") === "1";
+  if (enabled) console.info("[examiner-voice]", details);
+}
 
 export function stopExaminerSpeech() {
   const stop = activeSpeechStop;
@@ -310,6 +319,18 @@ async function speakBrowser(
   if (!resolvedVoice)
     throw new Error("Chrome 没有返回可用的英语语音，请检查系统语音设置。");
   if (resolvedVoice.fallbackUsed) options.onFallback?.(resolvedVoice.message);
+  voiceDebug({
+    event: "resolved",
+    examinerProfileId: options.examinerProfileId,
+    requestedVoiceId: options.voiceId,
+    resolvedVoiceId: resolvedVoice.voice.voiceURI,
+    resolvedVoiceName: resolvedVoice.voice.name,
+    requestedLocale: options.accent,
+    resolvedLocale: resolvedVoice.voice.lang,
+    requestedGender: resolvedVoice.preset.genderPresentation,
+    provider: "browser-speech-synthesis",
+    fallbackReason: resolvedVoice.fallbackUsed ? resolvedVoice.message : null,
+  });
 
   return new Promise((resolve, reject) => {
     const synth = window.speechSynthesis;
@@ -339,6 +360,7 @@ async function speakBrowser(
     utterance.pitch = Math.max(0.96, Math.min(1.04, options.pitch ?? 1));
     utterance.volume = Math.max(0, Math.min(1, options.volume ?? 1));
     utterance.onstart = () => {
+      voiceDebug({ event: "audio-start", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, audioStartTime: new Date().toISOString() });
       options.onState?.("speaking");
       driver.start();
     };
@@ -348,10 +370,16 @@ async function speakBrowser(
       options.onState?.("idle");
     };
     utterance.onresume = () => options.onState?.("speaking");
-    utterance.onend = () => finish();
+    utterance.onend = () => {
+      voiceDebug({ event: "audio-end", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, audioEndTime: new Date().toISOString() });
+      finish();
+    };
     utterance.onerror = (event) => {
       if (event.error === "canceled" || event.error === "interrupted") finish();
-      else finish(new Error("考官语音播放失败，请检查扬声器后重试。"));
+      else {
+        voiceDebug({ event: "playback-error", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, playbackError: event.error });
+        finish(new Error("考官语音播放失败，请检查扬声器后重试。"));
+      }
     };
     synth.speak(utterance);
   });
@@ -499,6 +527,7 @@ export async function speakExaminer(
   if (options.provider === "mock")
     return browserSpeechProvider.speak(text, options);
   try {
+    voiceDebug({ event: "remote-request", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, requestedLocale: options.accent, provider: "openai" });
     await remoteSpeechProvider.speak(text, options);
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") return;
