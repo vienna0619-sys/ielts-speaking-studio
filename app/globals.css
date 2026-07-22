@@ -668,7 +668,7 @@ label { display: grid; gap: 8px; color: var(--ink-soft); font-size: 12px; font-w
 .mock-examiner.speaking .mock-examiner-frame { animation: mock-examiner-breathe 4.8s ease-in-out infinite, mock-examiner-speaking 3.4s ease-in-out infinite; }
 .mock-examiner-sprite {
   position: absolute; inset: 0;
-  background-image: url("/examiners/mock-examiner-sprite-v2.webp");
+  background-image: url("../examiners/mock-examiner-sprite-v2.webp");
   background-repeat: no-repeat; background-size: 300% 400%;
   transition: background-position 55ms steps(1,end); will-change: transform, background-position;
 }
