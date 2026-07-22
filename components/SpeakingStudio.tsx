@@ -629,10 +629,13 @@ export default function SpeakingStudio() {
       setExaminerSpeechLevel(0);
       setExaminerViseme("rest");
       setExaminerActivity("idle");
-      const preset = getVoicePreset(voiceId);
+      const requestedPreset = getVoicePreset(voiceId);
+      const preset = requestedPreset.enabled
+        ? requestedPreset
+        : getVoicePreset("gb-female");
       setSettings((current) => ({
         ...current,
-        practiceVoiceId: voiceId,
+        practiceVoiceId: preset.id,
         accent: preset.accent,
       }));
     },
@@ -1765,9 +1768,9 @@ export default function SpeakingStudio() {
                   selectPracticeVoice(event.target.value as ExaminerVoiceId)
                 }
               >
-                {EXAMINER_VOICE_PRESETS.map((voice) => (
+                {EXAMINER_VOICE_PRESETS.filter((voice) => voice.enabled).map((voice) => (
                   <option value={voice.id} key={voice.id}>
-                    {ACCENT_LABELS[voice.accent]} · {voice.genderPresentation === "female" ? "女声" : "男声"}
+                    {ACCENT_LABELS[voice.accent]} · {voice.verifiedGenderPresentation === "female" ? "女声" : "男声"}
                   </option>
                 ))}
               </select>
