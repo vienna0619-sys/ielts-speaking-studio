@@ -190,3 +190,21 @@ test("avatar appearance is not fixed to one accent", () => {
   }
   assert.ok([...accentsByAvatar.values()].some((accents) => accents.size >= 2));
 });
+
+test("every formal examiner pairs appearance and verified voice gender", () => {
+  const availableVoiceIds = EXAMINER_VOICE_PRESETS
+    .filter((voice) => voice.enabled && voice.qualityStatus === "verified")
+    .map((voice) => voice.id);
+  for (let index = 0; index < 500; index += 1) {
+    const profile = createExaminerProfile({
+      seed: `gender-match-${index}`,
+      availableVoiceIds,
+    });
+    assert.equal(
+      profile.genderPresentation,
+      profile.verifiedGenderPresentation,
+    );
+    assert.equal(profile.qualityStatus, "verified");
+    assert.equal(profile.locked, true);
+  }
+});

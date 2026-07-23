@@ -1,8 +1,13 @@
 "use client";
 
-import { microphoneErrorMessage, providerErrorStatus } from "./core.mjs";
+import { microphoneErrorMessage } from "./core.mjs";
 import type { ExaminerVoiceId } from "./core.mjs";
 import { resolveBrowserVoice, waitForBrowserVoices } from "./examiner-voices";
+import { requestSpeech, requestTranscription } from "./ai-client";
+import {
+  registerAnimationTask,
+  registerAudioContext,
+} from "./examiner-motion";
 import type { Accent, ProviderMode } from "./types";
 
 interface SpeechRecognitionResultLike {
@@ -60,6 +65,19 @@ export interface ExaminerSpeechOptions {
   onLevel?: (level: number) => void;
   onViseme?: (viseme: SpeechViseme) => void;
   onFallback?: (message: string) => void;
+  onResolvedVoice?: (voice: {
+    requestedVoiceId: string;
+    resolvedVoiceId: string;
+    resolvedVoiceName: string;
+    resolvedLocale: string;
+    provider: string;
+    fallbackReason: string | null;
+  }) => void;
+  debugContext?: {
+    sessionId?: string;
+    appearanceProfileId?: string;
+    appearanceGenderPresentation?: string;
+  };
 }
 
 export interface ExaminerSpeechProvider {
@@ -69,12 +87,30 @@ export interface ExaminerSpeechProvider {
 
 let activeSpeechStop: (() => void) | null = null;
 
-function voiceDebug(details: Record<string, unknown>) {
-  if (typeof window === "undefined") return;
-  const enabled =
-    window.localStorage.getItem("vocalis.debug.voice") === "1" ||
-    new URLSearchParams(window.location.search).get("debugVoice") === "1";
-  if (enabled) console.info("[examiner-voice]", details);
+function voiceDebugEnabled() {
+  if (typeof window === "undefined") return false;
+  return (
+    new URLSearchParams(window.location.search).get("debugVoice") === "1" ||
+    window.localStorage.getItem("vocalis.debugVoice") === "1"
+  );
+}
+
+function voiceDebug(event: string, options: ExaminerSpeechOptions, data = {}) {
+  if (!voiceDebugEnabled()) return;
+  console.info("[vocalis-voice]", {
+    event,
+    sessionId: options.debugContext?.sessionId,
+    appearanceProfileId: options.debugContext?.appearanceProfileId,
+    appearanceGenderPresentation:
+      options.debugContext?.appearanceGenderPresentation,
+    requestedVoiceProfileId: options.voiceId,
+    requestedVoiceId: options.voiceId,
+    requestedGenderPresentation: options.voiceId.endsWith("-male")
+      ? "male"
+      : "female",
+    requestedLocale: options.accent,
+    ...data,
+  });
 }
 
 export function stopExaminerSpeech() {
@@ -95,28 +131,30 @@ export async function createMicrophoneSession(
       },
     });
     const context = new AudioContext();
+    const unregisterContext = registerAudioContext();
     const analyser = context.createAnalyser();
     analyser.fftSize = 512;
     context.createMediaStreamSource(stream).connect(analyser);
     const data = new Uint8Array(analyser.frequencyBinCount);
-    let animation = 0;
-    const update = () => {
+    let lastMeterUpdate = 0;
+    const unregisterAnimation = registerAnimationTask((now) => {
       analyser.getByteTimeDomainData(data);
       let sum = 0;
       for (const value of data) {
         const normalized = (value - 128) / 128;
         sum += normalized * normalized;
       }
-      onLevel(Math.min(1, Math.sqrt(sum / data.length) * 4.2));
-      animation = requestAnimationFrame(update);
-    };
-    update();
+      if (now - lastMeterUpdate >= 50) {
+        lastMeterUpdate = now;
+        onLevel(Math.min(1, Math.sqrt(sum / data.length) * 4.2));
+      }
+    });
     return {
       stream,
       stop: () => {
-        cancelAnimationFrame(animation);
+        unregisterAnimation();
         stream.getTracks().forEach((track) => track.stop());
-        void context.close();
+        void context.close().finally(unregisterContext);
         onLevel(0);
       },
     };
@@ -218,7 +256,7 @@ function createTextMouthDriver(
   rate: number,
   options: ExaminerSpeechOptions,
 ) {
-  let animation = 0;
+  let unregisterAnimation: (() => void) | null = null;
   let level = 0;
   let target = 0;
   let boundaryReceived = false;
@@ -266,12 +304,11 @@ function createTextMouthDriver(
       options.onViseme?.("rest");
     }
     options.onLevel?.(Math.min(1, level));
-    animation = requestAnimationFrame(frame);
   };
 
   return {
     start() {
-      frame();
+      unregisterAnimation = registerAnimationTask(frame);
       later(() => {
         if (boundaryReceived) return;
         const words = text.match(/[A-Za-z]+(?:'[A-Za-z]+)?/g) ?? [];
@@ -297,7 +334,8 @@ function createTextMouthDriver(
       options.onViseme?.("rest");
     },
     stop() {
-      cancelAnimationFrame(animation);
+      unregisterAnimation?.();
+      unregisterAnimation = null;
       timers.forEach((timer) => window.clearTimeout(timer));
       timers.clear();
       options.onLevel?.(0);
@@ -317,19 +355,29 @@ async function speakBrowser(
   const voices = await waitForBrowserVoices();
   const resolvedVoice = resolveBrowserVoice(options.voiceId, voices);
   if (!resolvedVoice)
-    throw new Error("Chrome 没有返回可用的英语语音，请检查系统语音设置。");
+    throw new Error(
+      "Chrome 没有返回与考官性别一致、且经过验证的英语语音。系统不会静默改用异性声音。",
+    );
   if (resolvedVoice.fallbackUsed) options.onFallback?.(resolvedVoice.message);
-  voiceDebug({
-    event: "resolved",
-    examinerProfileId: options.examinerProfileId,
+  options.onResolvedVoice?.({
     requestedVoiceId: options.voiceId,
     resolvedVoiceId: resolvedVoice.voice.voiceURI,
     resolvedVoiceName: resolvedVoice.voice.name,
-    requestedLocale: options.accent,
     resolvedLocale: resolvedVoice.voice.lang,
-    requestedGender: resolvedVoice.preset.genderPresentation,
     provider: "browser-speech-synthesis",
-    fallbackReason: resolvedVoice.fallbackUsed ? resolvedVoice.message : null,
+    fallbackReason: resolvedVoice.fallbackUsed
+      ? resolvedVoice.message
+      : null,
+  });
+  voiceDebug("resolved", options, {
+    resolvedVoiceId: resolvedVoice.voice.voiceURI,
+    resolvedVoiceName: resolvedVoice.voice.name,
+    resolvedLocale: resolvedVoice.voice.lang,
+    provider: "browser-speech-synthesis",
+    fallbackReason: resolvedVoice.fallbackUsed
+      ? resolvedVoice.message
+      : null,
+    voiceListLoaded: voices.length > 0,
   });
 
   return new Promise((resolve, reject) => {
@@ -360,7 +408,11 @@ async function speakBrowser(
     utterance.pitch = Math.max(0.96, Math.min(1.04, options.pitch ?? 1));
     utterance.volume = Math.max(0, Math.min(1, options.volume ?? 1));
     utterance.onstart = () => {
-      voiceDebug({ event: "audio-start", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, audioStartTime: new Date().toISOString() });
+      voiceDebug("audioStart", options, {
+        audioStart: performance.now(),
+        resolvedVoiceId: resolvedVoice.voice.voiceURI,
+        resolvedVoiceName: resolvedVoice.voice.name,
+      });
       options.onState?.("speaking");
       driver.start();
     };
@@ -371,33 +423,59 @@ async function speakBrowser(
     };
     utterance.onresume = () => options.onState?.("speaking");
     utterance.onend = () => {
-      voiceDebug({ event: "audio-end", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, audioEndTime: new Date().toISOString() });
+      voiceDebug("audioEnd", options, { audioEnd: performance.now() });
       finish();
     };
     utterance.onerror = (event) => {
+      voiceDebug("playbackError", options, { playbackError: event.error });
       if (event.error === "canceled" || event.error === "interrupted") finish();
-      else {
-        voiceDebug({ event: "playback-error", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, playbackError: event.error });
-        finish(new Error("考官语音播放失败，请检查扬声器后重试。"));
-      }
+      else finish(new Error("考官语音播放失败，请检查扬声器后重试。"));
     };
     synth.speak(utterance);
   });
+}
+
+let sharedPlaybackContext: AudioContext | null = null;
+let unregisterPlaybackContext: (() => void) | null = null;
+
+function getPlaybackContext() {
+  if (!sharedPlaybackContext || sharedPlaybackContext.state === "closed") {
+    sharedPlaybackContext = new AudioContext();
+    unregisterPlaybackContext = registerAudioContext();
+  }
+  return sharedPlaybackContext;
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener(
+    "pagehide",
+    () => {
+      const context = sharedPlaybackContext;
+      sharedPlaybackContext = null;
+      if (context && context.state !== "closed") {
+        void context.close().finally(() => {
+          unregisterPlaybackContext?.();
+          unregisterPlaybackContext = null;
+        });
+      }
+    },
+    { once: true },
+  );
 }
 
 function createAnalyserDriver(
   audio: HTMLAudioElement,
   options: ExaminerSpeechOptions,
 ) {
-  const context = new AudioContext();
+  const context = getPlaybackContext();
   const analyser = context.createAnalyser();
   analyser.fftSize = 512;
-  analyser.smoothingTimeConstant = 0.74;
+  analyser.smoothingTimeConstant = 0.82;
   const source = context.createMediaElementSource(audio);
   source.connect(analyser);
   analyser.connect(context.destination);
   const data = new Uint8Array(analyser.fftSize);
-  let animation = 0;
+  let unregisterAnimation: (() => void) | null = null;
   let smoothed = 0;
   let stopped = false;
   const frame = () => {
@@ -408,32 +486,35 @@ function createAnalyserDriver(
       const normalized = (value - 128) / 128;
       sum += normalized * normalized;
     }
-    const rms = Math.min(1, Math.sqrt(sum / data.length) * 5.8);
-    smoothed += (rms - smoothed) * (rms > smoothed ? 0.38 : 0.16);
-    options.onLevel?.(smoothed < 0.025 ? 0 : smoothed);
+    const raw = Math.sqrt(sum / data.length);
+    const rms = raw < 0.012 ? 0 : Math.min(1, (raw - 0.012) * 5.4);
+    smoothed += (rms - smoothed) * (rms > smoothed ? 0.26 : 0.12);
+    const level = smoothed < 0.025 ? 0 : Math.min(0.88, smoothed);
+    options.onLevel?.(level);
     options.onViseme?.(
-      smoothed < 0.04
+      level < 0.04
         ? "rest"
-        : smoothed > 0.58
+        : level > 0.58
           ? "open"
-          : smoothed > 0.3
+          : level > 0.3
             ? "wide"
             : "round",
     );
-    animation = requestAnimationFrame(frame);
   };
   return {
     async start() {
       await context.resume();
-      frame();
+      unregisterAnimation = registerAnimationTask(frame);
     },
     stop() {
       if (stopped) return;
       stopped = true;
-      cancelAnimationFrame(animation);
+      unregisterAnimation?.();
+      unregisterAnimation = null;
       options.onLevel?.(0);
       options.onViseme?.("rest");
-      void context.close();
+      source.disconnect();
+      analyser.disconnect();
     },
   };
 }
@@ -461,21 +542,33 @@ async function speakRemote(
   };
   activeSpeechStop = stop;
   options.onState?.("thinking");
+  voiceDebug("requestStart", options, { provider: "openai" });
   try {
-    const response = await fetch("/api/ai", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
+    const response = await requestSpeech(text, {
+      accent: options.accent,
+      voiceId: options.voiceId,
+      rate: options.rate,
       signal: controller.signal,
-      body: JSON.stringify({
-        operation: "speech",
-        text,
-        accent: options.accent,
-        voiceId: options.voiceId,
-        rate: options.rate,
-      }),
     });
-    if (!response.ok) throw new Error(providerErrorStatus(response.status));
     if (cancelled) return;
+    const resolvedVoice =
+      response.headers.get("x-vocalis-resolved-voice") || options.voiceId;
+    options.onResolvedVoice?.({
+      requestedVoiceId: options.voiceId,
+      resolvedVoiceId: resolvedVoice,
+      resolvedVoiceName: resolvedVoice,
+      resolvedLocale: options.accent,
+      provider: "openai",
+      fallbackReason: null,
+    });
+    voiceDebug("resolved", options, {
+      resolvedVoiceId: resolvedVoice,
+      resolvedVoiceName: resolvedVoice,
+      resolvedLocale: options.accent,
+      provider: "openai",
+      fallbackReason: null,
+      voiceListLoaded: true,
+    });
     objectUrl = URL.createObjectURL(await response.blob());
     audio = new Audio(objectUrl);
     audio.preload = "auto";
@@ -488,20 +581,37 @@ async function speakRemote(
         reject(new Error("AI 语音播放失败。"));
         return;
       }
-      audio.onplaying = () => options.onState?.("speaking");
+      audio.onplaying = () => {
+        voiceDebug("audioStart", options, {
+          audioStart: performance.now(),
+          resolvedVoiceId: resolvedVoice,
+        });
+        options.onState?.("speaking");
+      };
       audio.onpause = () => {
         options.onLevel?.(0);
         options.onViseme?.("rest");
         if (!audio?.ended && !cancelled) options.onState?.("idle");
       };
-      audio.onended = () => resolve();
-      audio.onerror = () => reject(new Error("AI 语音播放失败。"));
+      audio.onended = () => {
+        voiceDebug("audioEnd", options, { audioEnd: performance.now() });
+        resolve();
+      };
+      audio.onerror = () => {
+        voiceDebug("playbackError", options, {
+          playbackError: "html-audio-error",
+        });
+        reject(new Error("AI 语音播放失败。"));
+      };
       void audio
         .play()
         .catch(() =>
           reject(new Error("Chrome 阻止了语音播放，请点击页面后重试。")),
         );
     });
+  } catch (error) {
+    if (cancelled) return;
+    throw error;
   } finally {
     analyser?.stop();
     if (objectUrl) URL.revokeObjectURL(objectUrl);
@@ -527,7 +637,6 @@ export async function speakExaminer(
   if (options.provider === "mock")
     return browserSpeechProvider.speak(text, options);
   try {
-    voiceDebug({ event: "remote-request", examinerProfileId: options.examinerProfileId, requestedVoiceId: options.voiceId, requestedLocale: options.accent, provider: "openai" });
     await remoteSpeechProvider.speak(text, options);
   } catch (error) {
     if (error instanceof DOMException && error.name === "AbortError") return;
@@ -539,15 +648,5 @@ export async function speakExaminer(
 }
 
 export async function transcribeWithProvider(blob: Blob): Promise<string> {
-  const form = new FormData();
-  form.append("operation", "transcribe");
-  form.append(
-    "audio",
-    blob,
-    blob.type.includes("mp4") ? "answer.mp4" : "answer.webm",
-  );
-  const response = await fetch("/api/ai", { method: "POST", body: form });
-  if (!response.ok) throw new Error(providerErrorStatus(response.status));
-  const data = (await response.json()) as { text?: string };
-  return data.text?.trim() ?? "";
+  return requestTranscription(blob);
 }

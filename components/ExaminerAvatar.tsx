@@ -1,7 +1,11 @@
 "use client";
 
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
 import type { SpeechViseme } from "@/lib/browser-audio";
+import {
+  registerAnimationTask,
+  type ExaminerMotionController,
+} from "@/lib/examiner-motion";
 
 export type ExaminerActivity = "idle" | "speaking" | "listening" | "thinking";
 
@@ -18,7 +22,6 @@ interface AvatarTheme {
   shirt: string;
   accent: string;
 }
-
 const AVATAR_THEMES: Record<string, AvatarTheme> = {
   avery: {
     skin: "#d9a07d",
@@ -246,6 +249,7 @@ export function ExaminerAvatar({
   compact = false,
   avatarId = "avery",
   displayName = "Examiner Avery",
+  motion,
 }: {
   activity?: ExaminerActivity;
   speechLevel?: number;
@@ -253,99 +257,152 @@ export function ExaminerAvatar({
   compact?: boolean;
   avatarId?: string;
   displayName?: string;
+  motion?: ExaminerMotionController;
 }) {
   const theme = AVATAR_THEMES[avatarId] ?? AVATAR_THEMES.avery;
   const gradientId = useId().replaceAll(":", "");
-  const [blinking, setBlinking] = useState(false);
-  const [gaze, setGaze] = useState({ x: 0, y: 0 });
-  const [nodding, setNodding] = useState(false);
+  const frameRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<SVGGElement>(null);
+  const headRef = useRef<SVGGElement>(null);
+  const leftEyeRef = useRef<SVGGElement>(null);
+  const rightEyeRef = useRef<SVGGElement>(null);
+  const leftEyelidRef = useRef<SVGPathElement>(null);
+  const rightEyelidRef = useRef<SVGPathElement>(null);
+  const lowerFaceRef = useRef<SVGGElement>(null);
+  const mouthRef = useRef<SVGEllipseElement>(null);
+  const teethRef = useRef<SVGPathElement>(null);
+  const lowerLipRef = useRef<SVGPathElement>(null);
+  const chinRef = useRef<SVGPathElement>(null);
+  const activityRef = useRef(activity);
+  const speechLevelRef = useRef(speechLevel);
+  const visemeRef = useRef(viseme);
+  const [debugSnapshot, setDebugSnapshot] = useState(
+    motion?.snapshot() ?? null,
+  );
 
   useEffect(() => {
-    let blinkTimer = 0;
-    let releaseTimer = 0;
-    const schedule = () => {
-      blinkTimer = window.setTimeout(
-        () => {
-          setBlinking(true);
-          releaseTimer = window.setTimeout(
-            () => {
-              setBlinking(false);
-              schedule();
-            },
-            145 + Math.random() * 55,
-          );
-        },
-        2600 + Math.random() * 4300,
-      );
-    };
-    schedule();
-    return () => {
-      window.clearTimeout(blinkTimer);
-      window.clearTimeout(releaseTimer);
-    };
-  }, []);
+    activityRef.current = activity;
+    speechLevelRef.current = speechLevel;
+    visemeRef.current = viseme;
+    motion?.setActivity(activity);
+  }, [activity, motion, speechLevel, viseme]);
 
   useEffect(() => {
-    let gazeTimer = 0;
-    const schedule = () => {
-      gazeTimer = window.setTimeout(
-        () => {
-          setGaze(
-            activity === "listening"
-              ? { x: 0, y: 0 }
-              : {
-                  x: (Math.random() - 0.5) * 3.2,
-                  y: (Math.random() - 0.5) * 1.8,
-                },
-          );
-          schedule();
-        },
-        3200 + Math.random() * 4200,
+    let mouthBlend = 0;
+    let blinkStart = -1;
+    let nextBlink = performance.now() + 1800 + Math.random() * 3600;
+    let nextGaze = performance.now() + 2200 + Math.random() * 3200;
+    let gazeX = 0;
+    let gazeY = 0;
+    let targetGazeX = 0;
+    let targetGazeY = 0;
+    let nextNod = performance.now() + 4800 + Math.random() * 5200;
+    let nodStart = -1;
+    let lastDebug = 0;
+    const unregister = registerAnimationTask((now, deltaMs) => {
+      const currentActivity = motion?.getActivity() ?? activityRef.current;
+      const targetLevel =
+        currentActivity === "speaking"
+          ? motion?.getAudioLevel() ?? speechLevelRef.current
+          : 0;
+      const smoothing = targetLevel > mouthBlend ? 0.24 : 0.14;
+      mouthBlend += (Math.min(0.88, targetLevel) - mouthBlend) * smoothing;
+      if (mouthBlend < 0.012) mouthBlend = 0;
+      motion?.setMouthBlend(mouthBlend);
+      const currentViseme = motion?.getViseme() ?? visemeRef.current;
+      const shape =
+        currentViseme === "round"
+          ? { width: 0.78, height: 1.08 }
+          : currentViseme === "wide"
+            ? { width: 1.12, height: 0.72 }
+            : { width: 1, height: 1 };
+      const jaw = mouthBlend * 7;
+      mouthRef.current?.setAttribute(
+        "rx",
+        String(22 * shape.width + mouthBlend * 3),
       );
-    };
-    schedule();
-    return () => window.clearTimeout(gazeTimer);
-  }, [activity]);
-
-  useEffect(() => {
-    if (activity !== "listening") return;
-    let nodTimer = 0;
-    let releaseTimer = window.setTimeout(() => setNodding(false), 0);
-    const schedule = () => {
-      nodTimer = window.setTimeout(
-        () => {
-          setNodding(true);
-          releaseTimer = window.setTimeout(() => {
-            setNodding(false);
-            schedule();
-          }, 650);
-        },
-        5200 + Math.random() * 4500,
+      mouthRef.current?.setAttribute(
+        "ry",
+        String(1.2 + mouthBlend * 13 * shape.height),
       );
-    };
-    schedule();
-    return () => {
-      window.clearTimeout(nodTimer);
-      window.clearTimeout(releaseTimer);
-    };
-  }, [activity]);
+      mouthRef.current?.setAttribute(
+        "opacity",
+        mouthBlend > 0.015 ? "1" : "0",
+      );
+      teethRef.current?.setAttribute(
+        "opacity",
+        String(Math.max(0, Math.min(0.82, (mouthBlend - 0.22) * 2.4))),
+      );
+      if (lowerFaceRef.current)
+        lowerFaceRef.current.style.transform = `translateY(${jaw * 0.34}px)`;
+      lowerLipRef.current?.setAttribute(
+        "d",
+        `M188 ${319 + jaw * 0.35}c12 ${5 + mouthBlend * 4} 32 ${5 + mouthBlend * 4} 44 0-10 ${10 + mouthBlend * 2}-34 ${11 + mouthBlend * 2}-44 0Z`,
+      );
+      if (chinRef.current)
+        chinRef.current.style.transform = `translateY(${jaw * 0.5}px)`;
 
-  const mouth = useMemo(() => {
-    const level =
-      activity === "speaking" ? Math.max(0.05, Math.min(1, speechLevel)) : 0;
-    const shape =
-      viseme === "round"
-        ? { width: 0.72, height: 1.1 }
-        : viseme === "wide"
-          ? { width: 1.16, height: 0.68 }
-          : { width: 1, height: 1 };
-    return {
-      open: level,
-      rx: 22 * shape.width + level * 4,
-      ry: 1.4 + level * 14 * shape.height,
-      jaw: level * 7.5,
-    };
-  }, [activity, speechLevel, viseme]);
+      if (now >= nextBlink) {
+        blinkStart = now;
+        nextBlink = now + 2800 + Math.random() * 4400;
+        if (Math.random() < 0.12) nextBlink = now + 380;
+      }
+      const blinkProgress =
+        blinkStart < 0 ? 0 : Math.min(1, (now - blinkStart) / 170);
+      const lidScale =
+        blinkProgress >= 1 ? 0 : Math.sin(blinkProgress * Math.PI);
+      for (const lid of [leftEyelidRef.current, rightEyelidRef.current]) {
+        if (!lid) continue;
+        lid.style.opacity = String(lidScale);
+        lid.style.transform = `scaleY(${0.08 + lidScale * 0.92})`;
+      }
+      if (blinkProgress >= 1) blinkStart = -1;
+
+      if (now >= nextGaze) {
+        const listening = currentActivity === "listening";
+        targetGazeX = listening ? 0 : (Math.random() - 0.5) * 2.6;
+        targetGazeY = listening ? 0 : (Math.random() - 0.5) * 1.5;
+        nextGaze = now + 2800 + Math.random() * 4300;
+      }
+      gazeX += (targetGazeX - gazeX) * 0.025 * Math.min(2, deltaMs / 16.7);
+      gazeY += (targetGazeY - gazeY) * 0.025 * Math.min(2, deltaMs / 16.7);
+      const gazeTransform = `translate(${gazeX}px, ${gazeY}px)`;
+      if (leftEyeRef.current) leftEyeRef.current.style.transform = gazeTransform;
+      if (rightEyeRef.current)
+        rightEyeRef.current.style.transform = gazeTransform;
+
+      if (currentActivity === "listening" && now >= nextNod) {
+        nodStart = now;
+        nextNod = now + 6500 + Math.random() * 6500;
+      }
+      const nodProgress =
+        nodStart < 0 ? 0 : Math.min(1, (now - nodStart) / 720);
+      const nod = nodProgress >= 1 ? 0 : Math.sin(nodProgress * Math.PI) * 1.6;
+      if (nodProgress >= 1) nodStart = -1;
+      const breathing = Math.sin(now / 1650) * 0.8;
+      const speechHead =
+        currentActivity === "speaking" ? Math.sin(now / 720) * 0.45 : 0;
+      if (bodyRef.current)
+        bodyRef.current.style.transform = `translateY(${breathing * 0.45}px)`;
+      if (headRef.current)
+        headRef.current.style.transform = `translateY(${nod + breathing * 0.18}px) rotate(${speechHead}deg)`;
+      if (frameRef.current)
+        frameRef.current.style.setProperty("--avatar-motion-ready", "1");
+
+      if (
+        motion &&
+        (import.meta.env.DEV ||
+          new URLSearchParams(window.location.search).get(
+            "debugPerformance",
+          ) === "1") &&
+        now - lastDebug > 400
+      ) {
+        lastDebug = now;
+        setDebugSnapshot(motion.snapshot());
+      }
+    });
+    return unregister;
+  }, [motion]);
 
   const labels: Record<ExaminerActivity, string> = {
     idle: "Ready",
@@ -361,7 +418,8 @@ export function ExaminerAvatar({
     >
       <div className="examiner-halo" aria-hidden="true" />
       <div
-        className={`examiner-frame avatar-frame ${activity === "listening" && nodding ? "is-nodding" : ""}`}
+        ref={frameRef}
+        className="examiner-frame avatar-frame"
       >
         <svg
           className="avatar-rig"
@@ -392,7 +450,7 @@ export function ExaminerAvatar({
           </defs>
           <rect width="420" height="520" fill={`url(#${gradientId}-bg)`} />
           <circle cx="210" cy="210" r="164" fill={theme.accent} opacity=".09" />
-          <g className="avatar-body">
+          <g ref={bodyRef} className="avatar-body">
             <path
               d="M38 520c13-86 67-133 131-145h82c66 11 119 58 132 145Z"
               fill={`url(#${gradientId}-jacket)`}
@@ -407,7 +465,7 @@ export function ExaminerAvatar({
               fill={theme.skinShadow}
             />
           </g>
-          <g className="avatar-head">
+          <g ref={headRef} className="avatar-head">
             <HairBack avatarId={avatarId} color={theme.hair} />
             <ellipse
               cx="116"
@@ -445,7 +503,7 @@ export function ExaminerAvatar({
             </g>
             <g className="avatar-eye">
               <ellipse cx="166" cy="246" rx="23" ry="10.5" fill="#fffaf1" />
-              <g transform={`translate(${gaze.x} ${gaze.y})`}>
+              <g ref={leftEyeRef}>
                 <circle cx="166" cy="246" r="7" fill={theme.iris} />
                 <circle cx="166" cy="246" r="3" fill="#17211f" />
                 <circle
@@ -465,14 +523,15 @@ export function ExaminerAvatar({
               />
             </g>
             <path
-              className={`avatar-eyelid ${blinking ? "is-blinking" : ""}`}
+              ref={leftEyelidRef}
+              className="avatar-eyelid"
               d="M141 234c12-10 38-11 50 1v17c-12 8-38 8-50-1Z"
               fill={theme.skin}
               style={{ transformOrigin: "166px 234px" }}
             />
             <g className="avatar-eye">
               <ellipse cx="254" cy="246" rx="23" ry="10.5" fill="#fffaf1" />
-              <g transform={`translate(${gaze.x} ${gaze.y})`}>
+              <g ref={rightEyeRef}>
                 <circle cx="254" cy="246" r="7" fill={theme.iris} />
                 <circle cx="254" cy="246" r="3" fill="#17211f" />
                 <circle
@@ -492,7 +551,8 @@ export function ExaminerAvatar({
               />
             </g>
             <path
-              className={`avatar-eyelid ${blinking ? "is-blinking" : ""}`}
+              ref={rightEyelidRef}
+              className="avatar-eyelid"
               d="M229 235c12-10 38-11 50 0v17c-12 8-38 8-50 0Z"
               fill={theme.skin}
               style={{ transformOrigin: "254px 235px" }}
@@ -506,41 +566,42 @@ export function ExaminerAvatar({
               strokeLinecap="round"
             />
             <g
+              ref={lowerFaceRef}
               className="avatar-lower-face"
-              style={{ transform: `translateY(${mouth.jaw * 0.34}px)` }}
             >
               <ellipse
+                ref={mouthRef}
                 cx="210"
                 cy="318"
-                rx={mouth.rx}
-                ry={mouth.ry}
+                rx="22"
+                ry="1.2"
                 fill={theme.mouth}
-                opacity={mouth.open > 0.015 ? 1 : 0}
+                opacity="0"
               />
-              {mouth.open > 0.26 && (
-                <path
-                  d="M193 314c10-4 24-4 34 0-4 4-28 4-34 0Z"
-                  fill="#f3e9dc"
-                  opacity={Math.min(0.9, mouth.open)}
-                />
-              )}
+              <path
+                ref={teethRef}
+                d="M193 314c10-4 24-4 34 0-4 4-28 4-34 0Z"
+                fill="#f3e9dc"
+                opacity="0"
+              />
               <path
                 d="M188 317c8-5 14-7 22-4 8-3 15-1 22 4-12 3-32 3-44 0Z"
                 fill={theme.lip}
               />
               <path
-                d={`M188 ${319 + mouth.jaw * 0.35}c12 ${5 + mouth.open * 4} 32 ${5 + mouth.open * 4} 44 0-10 ${10 + mouth.open * 2}-34 ${11 + mouth.open * 2}-44 0Z`}
+                ref={lowerLipRef}
+                d="M188 319c12 5 32 5 44 0-10 10-34 11-44 0Z"
                 fill={theme.lip}
               />
             </g>
             <path
+              ref={chinRef}
               d="M178 348c18 11 47 11 65 0"
               fill="none"
               stroke={theme.skinLight}
               strokeOpacity=".2"
               strokeWidth="4"
               strokeLinecap="round"
-              style={{ transform: `translateY(${mouth.jaw * 0.5}px)` }}
             />
           </g>
         </svg>
@@ -550,6 +611,23 @@ export function ExaminerAvatar({
         <span>{labels[activity]}</span>
         <span className="fictional-label">{displayName} · Fictional AI</span>
       </div>
+      {debugSnapshot &&
+        (import.meta.env.DEV ||
+          (typeof window !== "undefined" &&
+            new URLSearchParams(window.location.search).get(
+              "debugPerformance",
+            ) === "1")) && (
+          <div className="examiner-performance" aria-label="开发性能诊断">
+            <span>{debugSnapshot.activity}</span>
+            <span>{debugSnapshot.fps} FPS</span>
+            <span>{debugSnapshot.resolvedVoice}</span>
+            <span>audio {debugSnapshot.audioLevel.toFixed(2)}</span>
+            <span>mouth {debugSnapshot.mouthBlendValue.toFixed(2)}</span>
+            <span>loops {debugSnapshot.activeAnimationLoopCount}</span>
+            <span>audio ctx {debugSnapshot.activeAudioContextCount}</span>
+            <span>dropped {debugSnapshot.droppedFrameEstimate}</span>
+          </div>
+        )}
     </div>
   );
 }

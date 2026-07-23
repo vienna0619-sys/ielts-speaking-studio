@@ -96,9 +96,13 @@ import { PracticeExaminer } from "./PracticeExaminer";
 import { HistoryReportDetail } from "./HistoryReportDetail";
 import { ExpressionLibraryView } from "./ExpressionLibraryView";
 import {
+  AiClientError,
+  checkAiHealth,
+  createAiRequestId,
   diagnoseOpenAi,
   diagnosticMessage,
   evaluateWithOpenAi,
+  getAiApiBaseLabel,
 } from "@/lib/ai-client";
 
 const DISCLAIMER =
@@ -115,6 +119,16 @@ const DEFAULT_EXAMINER_PROFILE = createExaminerProfile({
 
 type MicStatus = "unchecked" | "checking" | "ready" | "error";
 type PracticePhase = "idle" | "preparing" | "speaking" | "feedback";
+type AnalysisPhase =
+  | "EXAM_COMPLETE"
+  | "PREPARING_ANALYSIS"
+  | "CHECKING_SERVER"
+  | "UPLOADING"
+  | "SCORING"
+  | "VALIDATING_RESULT"
+  | "SAVING_REPORT"
+  | "ANALYSIS_COMPLETE"
+  | "ANALYSIS_FAILED";
 
 interface RecordingContext {
   kind: "exam" | "practice";
@@ -341,6 +355,10 @@ export default function SpeakingStudio() {
     null,
   );
   const [analysisError, setAnalysisError] = useState("");
+  const [analysisPhase, setAnalysisPhase] =
+    useState<AnalysisPhase>("EXAM_COMPLETE");
+  const [analysisRequestId, setAnalysisRequestId] = useState("");
+  const [analysisDiagnosticId, setAnalysisDiagnosticId] = useState("");
   const [accentEase, setAccentEase] = useState<HistoryRecord["accentEase"]>();
 
   const [practicePart, setPracticePart] = useState<1 | 2 | 3>(1);
@@ -737,6 +755,12 @@ export default function SpeakingStudio() {
       return;
     }
     try {
+      const health = await checkAiHealth();
+      if (!health.configured) {
+        throw new AiClientError("missing_api_key", 503, {
+          retryable: false,
+        });
+      }
       const diagnostic = await diagnoseOpenAi();
       setProviderReady(diagnostic.connected);
       setNotice(`${diagnostic.message} 模型：${diagnostic.model} · ${diagnostic.elapsedMs}ms`);
@@ -1080,8 +1104,11 @@ export default function SpeakingStudio() {
 
   const saveExamHistory = useCallback(
     async (report: AnalysisReport) => {
-      const scoredAt = new Date().toISOString();
-      const scoringModel = report.provider === "openai" ? "gpt-5.6-terra" : "local-mock-v2";
+      const scoredAt =
+        report.scoringGeneratedAt || new Date().toISOString();
+      const scoringModel =
+        report.scoringModel ||
+        (report.provider === "openai" ? "gpt-5.6-terra" : "local-mock-v2");
       const record: HistoryRecord = {
         id: plan.comboId,
         date: new Date().toISOString(),
@@ -1154,10 +1181,23 @@ export default function SpeakingStudio() {
       if (analysisRunRef.current === runKey) return;
       analysisRunRef.current = runKey;
       setAnalysisError("");
+      setAnalysisDiagnosticId("");
+      setAnalysisPhase("PREPARING_ANALYSIS");
       try {
         let report: AnalysisReport;
         if (settings.provider === "openai" && !forceMock) {
+          setAnalysisPhase("CHECKING_SERVER");
+          const health = await checkAiHealth();
+          if (!health.configured) {
+            throw new AiClientError("missing_api_key", 503, {
+              retryable: false,
+            });
+          }
           const metrics = calculateSpeechMetrics(segments);
+          const requestId =
+            analysisRequestId || createAiRequestId(`score-${plan.comboId}`);
+          setAnalysisRequestId(requestId);
+          setAnalysisPhase("UPLOADING");
           const cloud = await evaluateWithOpenAi<Omit<
             AnalysisReport,
             "metrics" | "provider" | "disclaimer"
@@ -1171,25 +1211,51 @@ export default function SpeakingStudio() {
                 segments: segments.map(storedSegment),
                 metrics,
                 note: "Pronunciation evidence is limited to timing and transcription reliability; mark phoneme claims low confidence.",
-              }, `score:${plan.comboId}:v1`);
+              }, requestId);
+          setAnalysisPhase("VALIDATING_RESULT");
           report = {
             ...cloud,
             metrics,
+            mode: "openai",
+            generatedAt:
+              (
+                cloud as typeof cloud & {
+                  scoringGeneratedAt?: string;
+                  scoringDiagnosticId?: string;
+                }
+              ).scoringGeneratedAt || new Date().toISOString(),
             provider: "openai",
             disclaimer: DISCLAIMER,
           };
+          setAnalysisDiagnosticId(
+            (
+              cloud as typeof cloud & {
+                scoringDiagnosticId?: string;
+              }
+            ).scoringDiagnosticId || "",
+          );
         } else {
+          setAnalysisPhase("SCORING");
           await new Promise((resolve) => window.setTimeout(resolve, 1100));
           report = mockAnalysis(segments, plan);
         }
+        setAnalysisPhase("SAVING_REPORT");
         setAnalysisReport(report);
         await saveExamHistory(report);
         clearCheckpoint();
         setCheckpoint(null);
+        setAnalysisPhase("ANALYSIS_COMPLETE");
         setExamState(transitionExam("ANALYSING", "ANALYSIS_COMPLETE"));
         setScreen("results");
       } catch (analysisFailure) {
         analysisRunRef.current = "";
+        setAnalysisPhase("ANALYSIS_FAILED");
+        if (analysisFailure instanceof AiClientError) {
+          setAnalysisRequestId(
+            analysisFailure.requestId || analysisRequestId,
+          );
+          setAnalysisDiagnosticId(analysisFailure.diagnosticId || "");
+        }
         setAnalysisError(
           analysisFailure instanceof Error
             ? diagnosticMessage(analysisFailure) || analysisFailure.message
@@ -1197,7 +1263,13 @@ export default function SpeakingStudio() {
         );
       }
     },
-    [plan, settings.provider, segments, saveExamHistory],
+    [
+      analysisRequestId,
+      plan,
+      settings.provider,
+      segments,
+      saveExamHistory,
+    ],
   );
 
   useEffect(() => {
@@ -1287,17 +1359,42 @@ export default function SpeakingStudio() {
     const hasMic = await ensureMic();
     if (!hasMic) return;
     setPlan(checkpoint.plan);
-    setExaminerProfile(
-      checkpoint.examinerProfile ??
-        createExaminerProfile({
+    const savedProfile = checkpoint.examinerProfile;
+    const savedVoice = savedProfile
+      ? EXAMINER_VOICE_PRESETS.find(
+          (voice) =>
+            voice.id === savedProfile.voiceId &&
+            voice.enabled &&
+            voice.qualityStatus === "verified" &&
+            voice.verifiedGenderPresentation ===
+              savedProfile.genderPresentation,
+        )
+      : null;
+    const savedAppearance = savedProfile
+      ? EXAMINER_AVATARS.find(
+          (avatar) =>
+            avatar.id === savedProfile.avatarId &&
+            avatar.enabled &&
+            avatar.genderPresentation === savedProfile.genderPresentation,
+        )
+      : null;
+    const restoredProfile =
+      savedProfile && savedVoice && savedAppearance
+        ? savedProfile
+        : createExaminerProfile({
           seed: checkpoint.id,
           availableVoiceIds: availableExamVoiceIds,
           randomEnabled: settings.randomExaminer,
           accentMode: settings.randomAccentMode,
           fixedVoiceId: settings.practiceVoiceId,
           excludedAccents: settings.excludedAccents,
-        }),
-    );
+        });
+    if (savedProfile && (!savedVoice || !savedAppearance)) {
+      setNotice(
+        "旧考试中的考官组合未通过当前性别/声音校验，已在恢复前换成匹配的已验证组合。",
+      );
+    }
+    setExaminerProfile(restoredProfile);
     setExamState(
       checkpoint.state === "ANALYSING" ? "FINISHED" : checkpoint.state,
     );
@@ -1527,8 +1624,16 @@ export default function SpeakingStudio() {
           metrics,
           note: "This is a user-requested reanalysis of a saved report. Pronunciation evidence is limited when only transcripts are available.",
         }, `reanalyze:${selectedHistory.id}:v${historyEnvelope.versions.length + 1}`);
-        report = { ...cloud, metrics, provider: "openai", disclaimer: DISCLAIMER };
-        scoringModel = "gpt-5.6-terra";
+        report = {
+          ...cloud,
+          metrics,
+          mode: "openai",
+          generatedAt:
+            cloud.scoringGeneratedAt || new Date().toISOString(),
+          provider: "openai",
+          disclaimer: DISCLAIMER,
+        };
+        scoringModel = cloud.scoringModel || "gpt-5.6-terra";
       } else {
         report = mockAnalysis(source.segments, source.examPlan ?? plan);
       }
@@ -1883,7 +1988,11 @@ export default function SpeakingStudio() {
         </header>
         {isAnalysing ? (
           <section className="analysis-stage">
-            <div className="analysis-orbit">
+            <div
+              className={`analysis-orbit ${
+                analysisPhase === "ANALYSIS_FAILED" ? "stopped" : ""
+              }`}
+            >
               <span />
               <span />
               <span />
@@ -1891,7 +2000,7 @@ export default function SpeakingStudio() {
                 <Icon name="spark" size={32} />
               </div>
             </div>
-            <span className="eyebrow">PRIVATE ANALYSIS</span>
+            <span className="eyebrow">{analysisPhase}</span>
             <h1>正在分析你的整场表现</h1>
             <p>
               整理分段转写、语速、停顿、词汇范围与四项公开评分标准。发音结论会标注置信度。
@@ -1899,16 +2008,51 @@ export default function SpeakingStudio() {
             <div className="analysis-steps">
               <span className="done">
                 <Icon name="check" />
-                录音分段
+                考试完成
               </span>
-              <span className="done">
-                <Icon name="check" />
-                语言特征
+              <span
+                className={
+                  analysisPhase === "CHECKING_SERVER" ? "active" : "done"
+                }
+              >
+                {analysisPhase === "CHECKING_SERVER" ? (
+                  <span className="spinner" />
+                ) : (
+                  <Icon name="check" />
+                )}
+                服务端检查
               </span>
-              <span className="active">
-                <span className="spinner" />
+              <span
+                className={
+                  analysisPhase === "ANALYSIS_FAILED"
+                    ? ""
+                    : analysisPhase === "ANALYSIS_COMPLETE"
+                      ? "done"
+                      : "active"
+                }
+              >
+                {analysisPhase === "ANALYSIS_COMPLETE" ? (
+                  <Icon name="check" />
+                ) : analysisPhase === "ANALYSIS_FAILED" ? (
+                  <Icon name="warning" />
+                ) : (
+                  <span className="spinner" />
+                )}
                 综合估分
               </span>
+            </div>
+            <div className="analysis-diagnostics">
+              <span>
+                前端：
+                {typeof window === "undefined" ? "—" : window.location.origin}
+              </span>
+              <span>服务端：{getAiApiBaseLabel()}</span>
+              {analysisRequestId && (
+                <span>requestId：{analysisRequestId}</span>
+              )}
+              {analysisDiagnosticId && (
+                <span>诊断编号：{analysisDiagnosticId}</span>
+              )}
             </div>
             {analysisError && (
               <div className="analysis-error">
@@ -1920,6 +2064,7 @@ export default function SpeakingStudio() {
                 <div>
                   <button
                     className="secondary"
+                    disabled={analysisPhase !== "ANALYSIS_FAILED"}
                     onClick={() => {
                       analysisRunRef.current = "";
                       void analyseSession();
@@ -1929,6 +2074,7 @@ export default function SpeakingStudio() {
                   </button>
                   <button
                     className="primary"
+                    disabled={analysisPhase !== "ANALYSIS_FAILED"}
                     onClick={() => {
                       analysisRunRef.current = "";
                       void analyseSession(true);

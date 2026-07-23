@@ -1,107 +1,248 @@
 import "server-only";
+
 import OpenAI from "openai";
-import type { SpeechCreateParams } from "openai/resources/audio/speech";
+import { zodTextFormat } from "openai/helpers/zod";
 import { z } from "zod";
 
-const API_BASE =
-  process.env.OPENAI_API_BASE?.replace(/\/$/, "") ||
-  "https://api.openai.com/v1";
+const SCORING_MODEL = process.env.OPENAI_TEXT_MODEL || "gpt-5.6-terra";
+const TRANSCRIPTION_MODEL =
+  process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
+const SPEECH_MODEL = process.env.OPENAI_TTS_MODEL || "gpt-4o-mini-tts";
+
+export type ProviderFailureCode =
+  | "missing_api_key"
+  | "invalid_api_key"
+  | "permission_denied"
+  | "insufficient_quota"
+  | "rate_limited"
+  | "model_unavailable"
+  | "request_timeout"
+  | "empty_transcript"
+  | "invalid_json"
+  | "schema_validation_failed"
+  | "provider_error";
 
 export class ProviderError extends Error {
   status: number;
-  code: string;
+  code: ProviderFailureCode;
   requestId?: string;
+  retryable: boolean;
 
-  constructor(message: string, status = 502, code = "provider_error", requestId?: string) {
+  constructor(
+    message: string,
+    status = 502,
+    code: ProviderFailureCode = "provider_error",
+    options: { requestId?: string; retryable?: boolean } = {},
+  ) {
     super(message);
     this.name = "ProviderError";
     this.status = status;
     this.code = code;
-    this.requestId = requestId;
+    this.requestId = options.requestId;
+    this.retryable =
+      options.retryable ?? (status === 429 || status >= 500);
   }
 }
 
-function apiKey() {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key)
+function configuredApiKey() {
+  const key = process.env.OPENAI_API_KEY?.trim();
+  if (!key) {
     throw new ProviderError(
-      "OpenAI provider is not configured on the server.",
+      "OpenAI API key is not configured on the server.",
       503,
+      "missing_api_key",
+      { retryable: false },
     );
+  }
   return key;
 }
 
-let openAiClient: OpenAI | null = null;
-
-function client() {
-  if (!openAiClient) {
-    openAiClient = new OpenAI({
-      apiKey: apiKey(),
-      baseURL: API_BASE,
-      maxRetries: 2,
-      timeout: 75_000,
-    });
-  }
-  return openAiClient;
+function client(timeout = 75_000) {
+  return new OpenAI({
+    apiKey: configuredApiKey(),
+    timeout,
+    maxRetries: 1,
+  });
 }
 
-function mapOpenAiError(error: unknown): ProviderError {
+function sanitizeProviderError(error: unknown): ProviderError {
   if (error instanceof ProviderError) return error;
-  if (error instanceof SyntaxError || error instanceof z.ZodError)
+  if (error instanceof OpenAI.APIConnectionTimeoutError) {
     return new ProviderError(
-      "The scoring response did not match the required report structure.",
-      502,
-      "invalid_response",
+      "OpenAI request timed out.",
+      504,
+      "request_timeout",
+      { retryable: true },
     );
-  if (error instanceof OpenAI.APIError) {
-    const status = error.status ?? 502;
-    const rawCode = typeof error.code === "string" ? error.code : "openai_error";
-    const code =
-      status === 401 ? "invalid_api_key" :
-      status === 403 ? "project_permission_denied" :
-      status === 404 ? "model_or_route_not_found" :
-      status === 429 && rawCode.includes("quota") ? "insufficient_quota" :
-      status === 429 ? "rate_limited" :
-      status >= 500 ? "openai_temporary_error" : rawCode;
-    return new ProviderError(error.message, status, code, error.requestID ?? undefined);
   }
-  if (error instanceof Error && error.name === "AbortError")
-    return new ProviderError("OpenAI request timed out.", 504, "timeout");
-  return new ProviderError("Unable to reach OpenAI.", 502, "network_error");
+  if (error instanceof OpenAI.APIError) {
+    const status = error.status || 502;
+    const requestId = error.requestID || undefined;
+    const providerCode =
+      typeof error.code === "string" ? error.code.toLowerCase() : "";
+    if (status === 401) {
+      return new ProviderError(
+        "The OpenAI API key is invalid or has been revoked.",
+        401,
+        "invalid_api_key",
+        { requestId, retryable: false },
+      );
+    }
+    if (status === 403) {
+      return new ProviderError(
+        "The OpenAI project does not have permission for this request.",
+        403,
+        "permission_denied",
+        { requestId, retryable: false },
+      );
+    }
+    if (status === 404 || providerCode.includes("model")) {
+      return new ProviderError(
+        "The configured OpenAI model is unavailable.",
+        404,
+        "model_unavailable",
+        { requestId, retryable: false },
+      );
+    }
+    if (status === 429 && providerCode.includes("quota")) {
+      return new ProviderError(
+        "The OpenAI API project has no available quota.",
+        429,
+        "insufficient_quota",
+        { requestId, retryable: false },
+      );
+    }
+    if (status === 429) {
+      return new ProviderError(
+        "OpenAI rate limit reached.",
+        429,
+        "rate_limited",
+        { requestId, retryable: true },
+      );
+    }
+    return new ProviderError(
+      "OpenAI could not complete the request.",
+      status,
+      "provider_error",
+      { requestId, retryable: status >= 500 },
+    );
+  }
+  if (
+    error instanceof Error &&
+    (error.name === "AbortError" || error.message.toLowerCase().includes("timeout"))
+  ) {
+    return new ProviderError(
+      "OpenAI request timed out.",
+      504,
+      "request_timeout",
+      { retryable: true },
+    );
+  }
+  return new ProviderError(
+    "Unable to reach OpenAI.",
+    502,
+    "provider_error",
+    { retryable: true },
+  );
 }
 
-function logProviderEvent(details: Record<string, unknown>) {
-  if (process.env.NODE_ENV !== "production" || process.env.AI_DEBUG_LOGS === "1")
-    console.info("[openai-provider]", details);
-}
+const confidenceSchema = z.enum(["low", "medium", "high"]);
+const bandSchema = z.number().min(1).max(9).multipleOf(0.5);
+const rangeSchema = z.tuple([z.number(), z.number()]);
+
+export const scoringReportSchema = z.object({
+  overall: bandSchema,
+  range: rangeSchema,
+  dimensions: z
+    .array(
+      z.object({
+        key: z.enum(["fluency", "lexical", "grammar", "pronunciation"]),
+        label: z.string(),
+        band: bandSchema,
+        range: rangeSchema,
+        confidence: confidenceSchema,
+        explanation: z.string(),
+        evidence: z.array(z.string()),
+        priority: z.string(),
+      }),
+    )
+    .length(4),
+  corrections: z.array(
+    z.object({
+      original: z.string(),
+      suggestion: z.string(),
+      type: z.string(),
+      explanationZh: z.string(),
+      naturalVersion: z.string(),
+      affectsUnderstanding: z.boolean(),
+      dimension: z.string(),
+      practice: z.string(),
+      certainty: z.enum(["error", "acceptable", "upgrade", "style"]),
+    }),
+  ),
+  bestPoints: z.array(z.string()).length(3),
+  priorities: z.array(z.string()).length(3),
+  nextGoal: z.string(),
+  recommendedPart: z.string(),
+  recommendedTopic: z.string(),
+  expressions: z.array(z.string()).length(5),
+  drill: z.string(),
+  improvedAnswers: z.array(
+    z.object({
+      part: z.number().int().min(1).max(3),
+      answer: z.string(),
+      phrases: z.array(z.string()),
+    }),
+  ),
+});
+
+const diagnosticSchema = z.object({
+  ok: z.literal(true),
+  schemaValid: z.literal(true),
+});
+
+export type ScoringReportPayload = z.infer<typeof scoringReportSchema>;
 
 export interface AiProvider {
   transcribe(audio: File): Promise<string>;
   synthesize(
     text: string,
     options: { accent: string; voiceId: string; rate: number },
-  ): Promise<ArrayBuffer>;
-  evaluate(payload: unknown): Promise<unknown>;
-  health(): Promise<{ configured: boolean; provider: string }>;
-  diagnose(): Promise<{ configured: boolean; connected: boolean; provider: string; model: string; elapsedMs: number; requestId?: string }>;
+  ): Promise<{ audio: ArrayBuffer; resolvedVoice: string }>;
+  evaluate(
+    payload: unknown,
+    options?: { requestId?: string },
+  ): Promise<{
+    report: ScoringReportPayload;
+    model: string;
+    providerRequestId?: string;
+  }>;
+  diagnose(options?: { requestId?: string }): Promise<{
+    ok: true;
+    schemaValid: true;
+    model: string;
+    providerRequestId?: string;
+  }>;
+  health(): {
+    configured: boolean;
+    provider: "openai";
+    model: string;
+    transcriptionModel: string;
+    speechModel: string;
+  };
 }
 
-function configuredTtsVoice(voiceId: string) {
-  const environmentNames: Record<string, string> = {
-    "gb-female": "OPENAI_TTS_VOICE_GB_FEMALE",
-    "gb-male": "OPENAI_TTS_VOICE_GB_MALE",
-    "us-female": "OPENAI_TTS_VOICE_US_FEMALE",
-    "us-male": "OPENAI_TTS_VOICE_US_MALE",
-    "au-female": "OPENAI_TTS_VOICE_AU_FEMALE",
-    "au-male": "OPENAI_TTS_VOICE_AU_MALE",
-    "in-female": "OPENAI_TTS_VOICE_IN_FEMALE",
-    "in-male": "OPENAI_TTS_VOICE_IN_MALE",
-  };
-  const configured = environmentNames[voiceId]
-    ? process.env[environmentNames[voiceId]]
+const voiceEnvironmentNames: Record<string, string> = {
+  "gb-female": "OPENAI_TTS_VOICE_GB_FEMALE",
+  "gb-male": "OPENAI_TTS_VOICE_GB_MALE",
+  "us-female": "OPENAI_TTS_VOICE_US_FEMALE",
+};
+function resolvedOpenAiTtsVoice(voiceId: string) {
+  const configuredName = voiceEnvironmentNames[voiceId];
+  const configured = configuredName
+    ? process.env[configuredName]?.trim()
     : undefined;
   if (configured) return configured;
-  if (process.env.OPENAI_TTS_VOICE) return process.env.OPENAI_TTS_VOICE;
   return voiceId.endsWith("-male") ? "cedar" : "marin";
 }
 
@@ -109,350 +250,147 @@ function examinerSpeechInstruction(accent: string) {
   const accentInstruction =
     accent === "en-US"
       ? "Use clear, natural North American English."
-      : accent === "en-AU"
-        ? "Use clear, natural Australian English."
-        : accent === "en-IN"
-          ? "Use clear, natural Indian English without caricature or exaggeration."
-          : "Use clear, natural standard British English.";
-  return `${accentInstruction} Speak like a calm, alert, courteous adult language examiner. Keep a neutral professional tone and a natural conversational pace. Avoid a hoarse, elderly, breathy, strained, theatrical, announcer-like, or overly cheerful delivery.`;
+      : "Use clear, natural standard British English.";
+  return `${accentInstruction} Speak like a calm, alert, courteous adult IELTS-style practice examiner. Keep a neutral professional tone and a natural conversational pace. Avoid a hoarse, elderly, breathy, strained, theatrical, announcer-like, or overly cheerful delivery. Do not imitate a real person.`;
 }
 
-function extractOutputText(data: Record<string, unknown>): string {
-  if (typeof data.output_text === "string") return data.output_text;
-  const output = Array.isArray(data.output) ? data.output : [];
-  for (const item of output) {
-    if (!item || typeof item !== "object") continue;
-    const content = Array.isArray((item as { content?: unknown[] }).content)
-      ? (item as { content: unknown[] }).content
-      : [];
-    for (const block of content) {
-      if (
-        block &&
-        typeof block === "object" &&
-        typeof (block as { text?: unknown }).text === "string"
-      ) {
-        return (block as { text: string }).text;
+function requestOptions(requestId?: string) {
+  return requestId
+    ? {
+        headers: {
+          "Idempotency-Key": requestId,
+          "X-Client-Request-Id": requestId,
+        },
       }
-    }
-  }
-  throw new ProviderError(
-    "The scoring model returned no readable output.",
-    502,
-  );
+    : undefined;
 }
-
-const reportSchema = {
-  type: "object",
-  additionalProperties: false,
-  required: [
-    "overall",
-    "range",
-    "dimensions",
-    "corrections",
-    "bestPoints",
-    "priorities",
-    "nextGoal",
-    "recommendedPart",
-    "recommendedTopic",
-    "expressions",
-    "drill",
-    "improvedAnswers",
-  ],
-  properties: {
-    overall: { type: "number", minimum: 1, maximum: 9, multipleOf: 0.5 },
-    range: {
-      type: "array",
-      minItems: 2,
-      maxItems: 2,
-      items: { type: "number" },
-    },
-    dimensions: {
-      type: "array",
-      minItems: 4,
-      maxItems: 4,
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "key",
-          "label",
-          "band",
-          "range",
-          "confidence",
-          "explanation",
-          "evidence",
-          "priority",
-        ],
-        properties: {
-          key: {
-            type: "string",
-            enum: ["fluency", "lexical", "grammar", "pronunciation"],
-          },
-          label: { type: "string" },
-          band: { type: "number", minimum: 1, maximum: 9, multipleOf: 0.5 },
-          range: {
-            type: "array",
-            minItems: 2,
-            maxItems: 2,
-            items: { type: "number" },
-          },
-          confidence: { type: "string", enum: ["low", "medium", "high"] },
-          explanation: { type: "string" },
-          evidence: { type: "array", items: { type: "string" } },
-          priority: { type: "string" },
-        },
-      },
-    },
-    corrections: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: [
-          "original",
-          "suggestion",
-          "type",
-          "explanationZh",
-          "naturalVersion",
-          "affectsUnderstanding",
-          "dimension",
-          "practice",
-          "certainty",
-        ],
-        properties: {
-          original: { type: "string" },
-          suggestion: { type: "string" },
-          type: { type: "string" },
-          explanationZh: { type: "string" },
-          naturalVersion: { type: "string" },
-          affectsUnderstanding: { type: "boolean" },
-          dimension: { type: "string" },
-          practice: { type: "string" },
-          certainty: {
-            type: "string",
-            enum: ["error", "acceptable", "upgrade", "style"],
-          },
-        },
-      },
-    },
-    bestPoints: {
-      type: "array",
-      minItems: 3,
-      maxItems: 3,
-      items: { type: "string" },
-    },
-    priorities: {
-      type: "array",
-      minItems: 3,
-      maxItems: 3,
-      items: { type: "string" },
-    },
-    nextGoal: { type: "string" },
-    recommendedPart: { type: "string" },
-    recommendedTopic: { type: "string" },
-    expressions: {
-      type: "array",
-      minItems: 5,
-      maxItems: 5,
-      items: { type: "string" },
-    },
-    drill: { type: "string" },
-    improvedAnswers: {
-      type: "array",
-      items: {
-        type: "object",
-        additionalProperties: false,
-        required: ["part", "answer", "phrases"],
-        properties: {
-          part: { type: "integer", minimum: 1, maximum: 3 },
-          answer: { type: "string" },
-          phrases: { type: "array", items: { type: "string" } },
-        },
-      },
-    },
-  },
-};
-
-const band = z.number().min(1).max(9).refine((value) => value * 2 === Math.round(value * 2));
-const bandRange = z.tuple([z.number(), z.number()]);
-const scoringReportValidator = z.object({
-  overall: band,
-  range: bandRange,
-  dimensions: z.array(z.object({
-    key: z.enum(["fluency", "lexical", "grammar", "pronunciation"]),
-    label: z.string().min(1),
-    band,
-    range: bandRange,
-    confidence: z.enum(["low", "medium", "high"]),
-    explanation: z.string().min(1),
-    evidence: z.array(z.string()),
-    priority: z.string().min(1),
-  }).strict()).length(4),
-  corrections: z.array(z.object({
-    original: z.string(),
-    suggestion: z.string(),
-    type: z.string(),
-    explanationZh: z.string(),
-    naturalVersion: z.string(),
-    affectsUnderstanding: z.boolean(),
-    dimension: z.string(),
-    practice: z.string(),
-    certainty: z.enum(["error", "acceptable", "upgrade", "style"]),
-  }).strict()),
-  bestPoints: z.array(z.string()).length(3),
-  priorities: z.array(z.string()).length(3),
-  nextGoal: z.string().min(1),
-  recommendedPart: z.string().min(1),
-  recommendedTopic: z.string().min(1),
-  expressions: z.array(z.string()).length(5),
-  drill: z.string().min(1),
-  improvedAnswers: z.array(z.object({
-    part: z.number().int().min(1).max(3),
-    answer: z.string(),
-    phrases: z.array(z.string()),
-  }).strict()),
-}).strict();
 
 export const openAiProvider: AiProvider = {
   async transcribe(audio) {
-    const model = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
-    const startedAt = Date.now();
     try {
-      const data = await client().audio.transcriptions.create({
+      const result = await client(90_000).audio.transcriptions.create({
         file: audio,
-        model,
+        model: TRANSCRIPTION_MODEL,
         language: "en",
         response_format: "json",
       });
-      if (!data.text?.trim())
-        throw new ProviderError("Transcription returned no text.", 422, "empty_transcript");
-      logProviderEvent({ route: "audio.transcriptions", model, status: 200, elapsedMs: Date.now() - startedAt });
-      return data.text;
+      const text = result.text?.trim();
+      if (!text) {
+        throw new ProviderError(
+          "Transcription returned no text.",
+          422,
+          "empty_transcript",
+          { retryable: false },
+        );
+      }
+      return text;
     } catch (error) {
-      const mapped = mapOpenAiError(error);
-      logProviderEvent({ route: "audio.transcriptions", model, status: mapped.status, code: mapped.code, requestId: mapped.requestId, elapsedMs: Date.now() - startedAt });
-      throw mapped;
+      throw sanitizeProviderError(error);
     }
   },
 
   async synthesize(text, options) {
-    const model = process.env.OPENAI_TTS_MODEL || "gpt-audio-1.5";
-    const startedAt = Date.now();
+    const resolvedVoice = resolvedOpenAiTtsVoice(options.voiceId);
     try {
-      const voice = configuredTtsVoice(options.voiceId);
-      if (model.startsWith("gpt-audio")) {
-        const pace = Math.max(0.85, Math.min(1.12, options.rate || 1));
-        const response = await client().chat.completions.create({
-          model,
-          modalities: ["text", "audio"],
-          audio: { voice, format: "mp3" },
-          messages: [
-            {
-              role: "system",
-              content: `${examinerSpeechInstruction(options.accent)} Use a natural pace near ${pace.toFixed(2)}x. Speak the supplied examiner line exactly, without adding an introduction, explanation, or closing.`,
-            },
-            { role: "user", content: text },
-          ],
-        });
-        const encoded = response.choices[0]?.message.audio?.data;
-        if (!encoded)
-          throw new ProviderError("The audio model returned no playable audio.", 502, "empty_audio_response");
-        const bytes = Buffer.from(encoded, "base64");
-        logProviderEvent({ route: "chat.completions.audio", model, status: 200, voiceProfileId: options.voiceId, elapsedMs: Date.now() - startedAt });
-        return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-      }
-      const response = await client().audio.speech.create({
-        model,
-        voice: voice as SpeechCreateParams["voice"],
+      const speech = await client(60_000).audio.speech.create({
+        model: SPEECH_MODEL,
+        voice: resolvedVoice,
         input: text,
         instructions: examinerSpeechInstruction(options.accent),
-        speed: Math.max(0.85, Math.min(1.12, options.rate || 1)),
+        speed: Math.max(0.88, Math.min(1.1, options.rate || 1)),
         response_format: "mp3",
       });
-      logProviderEvent({ route: "audio.speech", model, status: 200, voiceProfileId: options.voiceId, elapsedMs: Date.now() - startedAt });
-      return response.arrayBuffer();
+      return {
+        audio: await speech.arrayBuffer(),
+        resolvedVoice,
+      };
     } catch (error) {
-      const mapped = mapOpenAiError(error);
-      logProviderEvent({ route: "audio.speech", model, status: mapped.status, code: mapped.code, requestId: mapped.requestId, voiceProfileId: options.voiceId, elapsedMs: Date.now() - startedAt });
-      throw mapped;
+      throw sanitizeProviderError(error);
     }
   },
 
-  async evaluate(payload) {
-    const model = process.env.OPENAI_TEXT_MODEL || "gpt-5.6-terra";
-    const startedAt = Date.now();
-    const idempotencyKey =
-      payload && typeof payload === "object" && "idempotencyKey" in payload
-        ? String((payload as { idempotencyKey?: unknown }).idempotencyKey || "")
-        : "";
+  async evaluate(payload, options = {}) {
     try {
-      const response = await client().responses.create({
-          model,
+      const response = await client(90_000).responses.parse(
+        {
+          model: SCORING_MODEL,
           store: false,
+          reasoning: { effort: "low" },
           input: [
             {
               role: "system",
               content:
-                "You are a cautious IELTS speaking practice evaluator. Apply the four public IELTS speaking criteria equally. Never claim this is an official score. Use Chinese for explanations and natural English for corrected or improved answers. Do not treat all informal spoken language as an error. Separate definite errors, acceptable-but-less-natural wording, upgrades, and style. Pronunciation claims must remain low confidence because only transcripts and timing features are provided; do not invent phoneme-level evidence. Preserve the learner's meaning and make improved answers only 0.5 to 1 band stronger, not Band 9 scripts.",
+                "You are a cautious IELTS speaking practice evaluator. Apply the four public IELTS speaking criteria equally. Never call the estimate an official IELTS score. Use Chinese for explanations and natural English for corrected or improved answers. Distinguish definite errors, acceptable but less natural wording, upgrades, and style. Pronunciation confidence must remain low when only transcripts and timing data are available; never invent acoustic or phoneme evidence. Preserve the learner's meaning and make improved answers only about 0.5 to 1 band stronger, not memorized Band 9 scripts.",
             },
             {
               role: "user",
-              content: `Evaluate this practice session. Evidence:\n${JSON.stringify(payload)}`,
+              content: `Evaluate this practice session from the supplied evidence. If evidence is missing, state the limitation rather than inventing it.\n${JSON.stringify(payload)}`,
             },
           ],
           text: {
-            format: {
-              type: "json_schema",
-              name: "ielts_speaking_report",
-              strict: true,
-              schema: reportSchema,
-            },
+            format: zodTextFormat(scoringReportSchema, "ielts_speaking_report"),
           },
-        }, idempotencyKey ? { headers: { "Idempotency-Key": idempotencyKey } } : undefined);
-      const parsed = scoringReportValidator.parse(
-        JSON.parse(extractOutputText(response as unknown as Record<string, unknown>)),
+        },
+        requestOptions(options.requestId),
       );
-      logProviderEvent({ route: "responses.evaluate", model, status: 200, requestId: response._request_id, elapsedMs: Date.now() - startedAt });
-      return parsed;
-    } catch (error) {
-      const mapped = mapOpenAiError(error);
-      logProviderEvent({ route: "responses.evaluate", model, status: mapped.status, code: mapped.code, requestId: mapped.requestId, elapsedMs: Date.now() - startedAt });
-      throw mapped;
-    }
-  },
-
-  async health() {
-    return {
-      configured: Boolean(process.env.OPENAI_API_KEY),
-      provider: "openai",
-    };
-  },
-
-  async diagnose() {
-    const model = process.env.OPENAI_TEXT_MODEL || "gpt-5.6-terra";
-    const startedAt = Date.now();
-    if (!process.env.OPENAI_API_KEY)
-      throw new ProviderError("OpenAI provider is not configured on the server.", 503, "missing_api_key");
-    try {
-      const response = await client().responses.create({
-        model,
-        store: false,
-        input: "Reply with only OK.",
-        max_output_tokens: 8,
-      });
-      const output = response.output_text.trim().toUpperCase();
-      if (!output.includes("OK"))
-        throw new ProviderError("OpenAI returned an unexpected diagnostic response.", 502, "invalid_diagnostic_response");
+      if (!response.output_parsed) {
+        throw new ProviderError(
+          "The scoring result did not match the required schema.",
+          502,
+          "schema_validation_failed",
+          { requestId: response._request_id ?? undefined, retryable: true },
+        );
+      }
       return {
-        configured: true,
-        connected: true,
-        provider: "openai",
-        model,
-        elapsedMs: Date.now() - startedAt,
-        requestId: response._request_id ?? undefined,
+        report: response.output_parsed,
+        model: SCORING_MODEL,
+        providerRequestId: response._request_id || undefined,
       };
     } catch (error) {
-      throw mapOpenAiError(error);
+      throw sanitizeProviderError(error);
     }
+  },
+
+  async diagnose(options = {}) {
+    try {
+      const response = await client(30_000).responses.parse(
+        {
+          model: SCORING_MODEL,
+          store: false,
+          reasoning: { effort: "none" },
+          max_output_tokens: 80,
+          input: "Return the requested connection diagnostic object.",
+          text: {
+            format: zodTextFormat(diagnosticSchema, "vocalis_diagnostic"),
+          },
+        },
+        requestOptions(options.requestId),
+      );
+      if (!response.output_parsed) {
+        throw new ProviderError(
+          "OpenAI returned an invalid diagnostic result.",
+          502,
+          "schema_validation_failed",
+          { requestId: response._request_id ?? undefined, retryable: true },
+        );
+      }
+      return {
+        ...response.output_parsed,
+        model: SCORING_MODEL,
+        providerRequestId: response._request_id || undefined,
+      };
+    } catch (error) {
+      throw sanitizeProviderError(error);
+    }
+  },
+
+  health() {
+    return {
+      configured: Boolean(process.env.OPENAI_API_KEY?.trim()),
+      provider: "openai",
+      model: SCORING_MODEL,
+      transcriptionModel: TRANSCRIPTION_MODEL,
+      speechModel: SPEECH_MODEL,
+    };
   },
 };

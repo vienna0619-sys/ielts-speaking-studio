@@ -116,18 +116,24 @@ export interface ExaminerProfile {
   avatarId: string;
   appearanceProfile: string;
   voiceProvider: "adaptive";
+  requestedVoiceId: ExaminerVoiceId;
   voiceId: ExaminerVoiceId;
   accent: ExaminerAccent;
   locale: ExaminerAccent;
   genderPresentation: ExaminerGenderPresentation;
+  verifiedGenderPresentation: ExaminerGenderPresentation;
   estimatedAgeRange: string;
   speakingRate: number;
   pitch: number;
   volume: number;
   qualityLevel: "high" | "unverified";
+  qualityStatus: ExaminerVoicePreset["qualityStatus"];
   enabled: boolean;
   supportedModes: ("mock-exam" | "practice")[];
   fallbackVoiceId: ExaminerVoiceId;
+  selectedAt: string;
+  fallbackReason: string | null;
+  locked: true;
   createdAt: string;
 }
 

@@ -80,6 +80,11 @@ export interface AnalysisReport extends ScoreReport {
   improvedAnswers: { part: number; answer: string; phrases: string[] }[];
   provider: ProviderMode;
   disclaimer: string;
+  scoringProvider?: "openai";
+  scoringModel?: string;
+  scoringGeneratedAt?: string;
+  scoringRequestId?: string;
+  scoringDiagnosticId?: string;
 }
 
 export interface HistoryRecord {

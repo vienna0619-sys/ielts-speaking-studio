@@ -200,14 +200,32 @@ export function resolveBrowserVoice(
   voices: SpeechSynthesisVoice[],
 ): ResolvedBrowserVoice | null {
   const preset = getVoicePreset(voiceId);
-  let resolvedPreset = preset.enabled
-    ? preset
-    : (EXAMINER_VOICE_PRESETS.find((candidate) => candidate.id === "gb-female") ?? EXAMINER_VOICE_PRESETS[0]);
+  const verifiedSameGender = (candidate: ExaminerVoicePreset) =>
+    candidate.enabled &&
+    candidate.qualityStatus === "verified" &&
+    candidate.verifiedGenderPresentation ===
+      candidate.genderPresentation &&
+    candidate.genderPresentation === preset.genderPresentation;
+  let resolvedPreset =
+    (verifiedSameGender(preset) ? preset : null) ||
+    EXAMINER_VOICE_PRESETS.find(
+      (candidate) =>
+        candidate.id === preset.fallbackVoiceId &&
+        verifiedSameGender(candidate),
+    ) ||
+    EXAMINER_VOICE_PRESETS.find(
+      (candidate) =>
+        candidate.accent === "en-GB" && verifiedSameGender(candidate),
+    ) ||
+    EXAMINER_VOICE_PRESETS.find(verifiedSameGender);
+  if (!resolvedPreset) return null;
   let voice = bestForPreset(voices, resolvedPreset, true);
 
   if (!voice) {
     const regionalBackup = EXAMINER_VOICE_PRESETS.find(
-      (candidate) => candidate.id === preset.fallbackVoiceId,
+      (candidate) =>
+        candidate.id === preset.fallbackVoiceId &&
+        verifiedSameGender(candidate),
     );
     if (regionalBackup) {
       voice = bestForPreset(voices, regionalBackup, true);
@@ -218,7 +236,7 @@ export function resolveBrowserVoice(
     const britishSameStyle = EXAMINER_VOICE_PRESETS.find(
       (candidate) =>
         candidate.accent === "en-GB" &&
-        candidate.genderPresentation === preset.genderPresentation,
+        verifiedSameGender(candidate),
     );
     if (britishSameStyle) {
       voice = bestForPreset(voices, britishSameStyle, true);
@@ -226,14 +244,18 @@ export function resolveBrowserVoice(
     }
   }
   if (!voice) {
-    const british =
-      EXAMINER_VOICE_PRESETS.find(
-        (candidate) => candidate.accent === "en-GB",
-      ) ?? EXAMINER_VOICE_PRESETS[0];
-    voice = bestForPreset(voices, british, true);
-    resolvedPreset = british;
+    const currentResolvedId = resolvedPreset.id;
+    const anySameGender = EXAMINER_VOICE_PRESETS.find(
+      (candidate) =>
+        candidate.id !== currentResolvedId &&
+        verifiedSameGender(candidate) &&
+        Boolean(bestForPreset(voices, candidate, true)),
+    );
+    if (anySameGender) {
+      voice = bestForPreset(voices, anySameGender, true);
+      resolvedPreset = anySameGender;
+    }
   }
-  if (!voice) voice = bestForPreset(voices, preset, false);
   if (!voice) return null;
 
   const exactLocale =

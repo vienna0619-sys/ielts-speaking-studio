@@ -35,6 +35,8 @@ jobs:
 
       - name: Build GitHub Pages edition
         run: npm run build:pages
+        env:
+          VITE_AI_API_BASE_URL: https://ielts-speaking-studio.vienna0619.chatgpt.site
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
